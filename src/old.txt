@@ -1,0 +1,560 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ArduinoHA.h>
+#include <RCSwitch.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
+#include "secrets.h"
+
+// --- Pin Definitions (Unchanged) ---
+const int RELAY_MOTOR_DIRECTION_PIN = 1, RELAY_MOTOR_ENABLE_PIN = 3, RELAY_INDICATOR_LIGHT_PIN = 4;
+const int MANUAL_OPEN_BUTTON_PIN = 5, MANUAL_CLOSE_BUTTON_PIN = 6, MANUAL_STOP_BUTTON_PIN = 7;
+const int MOVEMENT_INHIBIT_PIN = 8, LIMIT_OPEN_PIN = 10, LIMIT_CLOSE_PIN = 20, PHOTO_BARRIER_PIN = 2;
+const int RF_RECEIVER_PIN = 21;
+const unsigned long GATE_TIMEOUT = 45000;
+const unsigned long MOTOR_DIRECTION_DELAY = 700;
+
+// --- State Machine Enums (Unchanged) ---
+enum CoverOperation
+{
+  IDLE,
+  OPENING,
+  CLOSING
+};
+enum CalibrationState
+{
+  CAL_INACTIVE,
+  CAL_CLOSING_TO_START,
+  CAL_WAITING_AFTER_CLOSE,
+  CAL_OPENING_FOR_TIMING,
+  CAL_DONE
+};
+
+// --- Global State Variables ---
+CoverOperation current_operation = IDLE;
+CalibrationState cal_state = CAL_INACTIVE;
+float current_position = 0.0;
+unsigned long gate_travel_time = 30000;
+unsigned long movement_start_time = 0;
+float movement_start_position = 0.0;
+bool photo_barrier_reversing = false;
+unsigned long last_rf_code_received = 0;
+
+// --- MQTT & Home Assistant Objects ---
+WiFiClient wifiClient;
+HADevice device;
+HAMqtt mqtt(wifiClient, device);
+HACover cover("sliding_gate_cover");
+HABinarySensor limitOpen("sliding_gate_limit_open");
+HABinarySensor limitClose("sliding_gate_limit_close");
+HABinarySensor photoBarrier("sliding_gate_photo_barrier");
+HABinarySensor movementInhibit("sliding_gate_movement_inhibit");
+HASensor rfCodeSensor("sliding_gate_last_rf_code");
+HAButton calibrateButton("sliding_gate_calibrate");
+
+// --- Other Objects ---
+RCSwitch mySwitch = RCSwitch();
+
+// --- Function Prototypes ---
+void save_state_to_fs();
+void load_state_from_fs();
+void start_opening();
+void start_closing();
+void stop_movement(bool triggered_by_user = false);
+void start_calibration();
+void handle_calibration();
+void setup_pins();
+void setup_wifi();
+void boot_check();
+void handle_manual_controls();
+void handle_rf_signal();
+void handle_safety_sensors();
+void handle_indicator_light();
+void update_gate_position();
+void publish_all_states();
+void onCoverCommand(HACover::CoverCommand cmd, HACover *sender);
+void onCalibrateCommand(HAButton *sender);
+
+// =================================================================
+// Setup and Main Loop
+// =================================================================
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("Booting Gate Controller (vFinalFix)...");
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("FATAL: LittleFS Mount Failed. Halting.");
+    while (1)
+      delay(1000);
+  }
+
+  setup_pins();
+
+  byte mac[6];
+  WiFi.macAddress(mac);
+  device.setUniqueId(mac, sizeof(mac));
+  device.setName("Sliding Gate");
+  device.setManufacturer("DIY");
+  device.setModel("ESP32-C3");
+
+  cover.setName("Sliding Gate");
+  cover.setDeviceClass("gate");
+  cover.onCommand(onCoverCommand);
+
+  limitOpen.setName("Open Limit");
+  limitOpen.setDeviceClass("opening");
+  limitClose.setName("Close Limit");
+  limitClose.setDeviceClass("opening");
+  photoBarrier.setName("Photo Barrier");
+  photoBarrier.setDeviceClass("safety");
+  movementInhibit.setName("Movement Inhibit");
+  movementInhibit.setDeviceClass("safety");
+  rfCodeSensor.setName("Last RF Code");
+  rfCodeSensor.setIcon("mdi:remote-control");
+  calibrateButton.setName("Calibrate");
+  calibrateButton.setIcon("mdi:wrench");
+  calibrateButton.onCommand(onCalibrateCommand);
+
+  setup_wifi();
+  load_state_from_fs();
+  boot_check();
+  // Receiver setup (matches your ESPHome config)
+  mySwitch.enableReceive(RF_RECEIVER_PIN);  // GPIO21 (same as your YAML)
+  mySwitch.setProtocol(6);     // Protocol 6 (as in your YAML)
+  mySwitch.setReceiveTolerance(80);   // 80% tolerance (as in your YAML)
+
+  mqtt.begin(MQTT_SERVER, MQTT_USER, MQTT_PASSWORD);
+}
+
+void loop()
+{
+  handle_rf_signal();
+  mqtt.loop();
+
+  if (cal_state != CAL_INACTIVE)
+  {
+    handle_calibration();
+  }
+  else if (current_operation != IDLE)
+  {
+    update_gate_position();
+  }
+
+  handle_manual_controls();
+  handle_safety_sensors();
+  
+  handle_indicator_light();
+
+  // Small delay to prevent the loop from running too hot and to be friendly to other tasks
+  delay(10);
+}
+
+// =================================================================
+// Home Assistant Command Callbacks
+// =================================================================
+void onCoverCommand(HACover::CoverCommand cmd, HACover *sender)
+{
+  // FIX: Add guard to prevent normal commands during calibration
+  if (cal_state != CAL_INACTIVE)
+  {
+    Serial.println("Ignoring command: Calibration in progress.");
+    return;
+  }
+
+  switch (cmd)
+  {
+  case HACover::CommandOpen:
+    Serial.println("Received OPEN command from HA");
+    start_opening();
+    break;
+  case HACover::CommandClose:
+    Serial.println("Received CLOSE command from HA");
+    start_closing();
+    break;
+  case HACover::CommandStop:
+    Serial.println("Received STOP command from HA");
+    stop_movement(true);
+    break;
+  }
+}
+
+void onCalibrateCommand(HAButton *sender)
+{
+  Serial.println("Received CALIBRATE command from HA");
+  start_calibration();
+}
+
+// =================================================================
+// Core Logic (with Corrected Guards)
+// =================================================================
+void start_opening()
+{
+  // FIX: Simplified guard. Function should only care about current operation, not calibration state.
+  if (current_operation != IDLE || current_position >= 1.0)
+    return;
+  if (digitalRead(MOVEMENT_INHIBIT_PIN) == LOW)
+    return;
+
+  current_operation = OPENING;
+  cover.setState(HACover::StateOpening);
+  movement_start_time = millis();
+  movement_start_position = current_position;
+  digitalWrite(RELAY_MOTOR_ENABLE_PIN, LOW);
+  delay(MOTOR_DIRECTION_DELAY);
+  digitalWrite(RELAY_MOTOR_DIRECTION_PIN, LOW);
+  delay(MOTOR_DIRECTION_DELAY);
+  digitalWrite(RELAY_MOTOR_ENABLE_PIN, HIGH);
+}
+
+void start_closing()
+{
+  // FIX: Simplified guard.
+  if (current_operation != IDLE || current_position <= 0.0)
+    return;
+  if (digitalRead(MOVEMENT_INHIBIT_PIN) == LOW || digitalRead(PHOTO_BARRIER_PIN) == LOW)
+    return;
+
+  current_operation = CLOSING;
+  cover.setState(HACover::StateClosing);
+  movement_start_time = millis();
+  movement_start_position = current_position;
+  digitalWrite(RELAY_MOTOR_ENABLE_PIN, LOW);
+  delay(MOTOR_DIRECTION_DELAY);
+  digitalWrite(RELAY_MOTOR_DIRECTION_PIN, HIGH);
+  delay(MOTOR_DIRECTION_DELAY);
+  digitalWrite(RELAY_MOTOR_ENABLE_PIN, HIGH);
+}
+
+void stop_movement(bool triggered_by_user)
+{
+  if (current_operation == IDLE && cal_state == CAL_INACTIVE)
+    return;
+  digitalWrite(RELAY_MOTOR_ENABLE_PIN, LOW);
+  current_operation = IDLE;
+
+  if (current_position >= 1.0)
+    cover.setState(HACover::StateOpen);
+  else if (current_position <= 0.0)
+    cover.setState(HACover::StateClosed);
+  else
+    cover.setState(HACover::StateStopped);
+
+  if (triggered_by_user)
+  {
+    if (cal_state != CAL_INACTIVE)
+    {
+      Serial.println("Calibration cancelled by user.");
+      cal_state = CAL_INACTIVE;
+    }
+    photo_barrier_reversing = false;
+  }
+  save_state_to_fs();
+}
+
+void update_gate_position()
+{
+  unsigned long elapsed = millis() - movement_start_time;
+  float ratio = (gate_travel_time == 0) ? 0 : (float)elapsed / (float)gate_travel_time;
+  if (current_operation == OPENING)
+  {
+    current_position = movement_start_position + ratio;
+  }
+  else if (current_operation == CLOSING)
+  {
+    current_position = movement_start_position - ratio;
+  }
+  current_position = constrain(current_position, 0.0, 1.0);
+  cover.setCurrentPosition(current_position * 100);
+  if (current_position >= 1.0 || current_position <= 0.0)
+  {
+    stop_movement(false);
+  }
+}
+
+void handle_safety_sensors()
+{
+  // Publish sensor states. The library handles "on change" logic internally.
+  limitOpen.setState(digitalRead(LIMIT_OPEN_PIN) == LOW);
+  limitClose.setState(digitalRead(LIMIT_CLOSE_PIN) == LOW);
+  photoBarrier.setState(digitalRead(PHOTO_BARRIER_PIN) == LOW);
+  movementInhibit.setState(digitalRead(MOVEMENT_INHIBIT_PIN) == LOW);
+
+  if (cal_state != CAL_INACTIVE)
+    return;
+  if (digitalRead(MOVEMENT_INHIBIT_PIN) == LOW && current_operation != IDLE)
+  {
+    stop_movement(true);
+    return;
+  }
+  if (current_operation == OPENING && digitalRead(LIMIT_OPEN_PIN) == LOW)
+  {
+    stop_movement(false);
+    current_position = 1.0;
+    cover.setCurrentPosition(100);
+    photo_barrier_reversing = false;
+    save_state_to_fs();
+  }
+  if (current_operation == CLOSING && digitalRead(LIMIT_CLOSE_PIN) == LOW)
+  {
+    stop_movement(false);
+    current_position = 0.0;
+    cover.setCurrentPosition(0);
+    photo_barrier_reversing = false;
+    save_state_to_fs();
+  }
+  static bool pb_active_prev = false;
+  bool pb_active_curr = (digitalRead(PHOTO_BARRIER_PIN) == LOW);
+  if (pb_active_curr && !pb_active_prev)
+  {
+    if (current_operation == CLOSING)
+    {
+      stop_movement(false);
+      photo_barrier_reversing = true;
+      delay(200);
+      start_opening();
+    }
+  }
+  else if (!pb_active_curr && pb_active_prev)
+  {
+    if (photo_barrier_reversing)
+    {
+      stop_movement(false);
+    }
+  }
+  pb_active_prev = pb_active_curr;
+}
+
+void start_calibration()
+{
+  if (current_operation != IDLE || cal_state != CAL_INACTIVE)
+    return;
+  Serial.println("--- Starting Full Calibration ---");
+  cal_state = CAL_CLOSING_TO_START;
+  photo_barrier_reversing = false;
+  start_closing(); // This now works because the guard in start_closing() is fixed
+}
+
+void handle_calibration()
+{
+  static unsigned long timer_start = 0;
+  switch (cal_state)
+  {
+  case CAL_CLOSING_TO_START:
+    if (digitalRead(LIMIT_CLOSE_PIN) == LOW)
+    {
+      stop_movement(false);
+      current_position = 0.0;
+      cover.setCurrentPosition(0);
+      save_state_to_fs();
+      Serial.println("Calibration Step 1 Complete");
+      timer_start = millis();
+      cal_state = CAL_WAITING_AFTER_CLOSE;
+    }
+    break;
+  case CAL_WAITING_AFTER_CLOSE:
+    if (millis() - timer_start > 1000)
+    {
+      Serial.println("Calibration Step 2: Opening...");
+      start_opening();
+      timer_start = millis();
+      cal_state = CAL_OPENING_FOR_TIMING;
+    }
+    break;
+  case CAL_OPENING_FOR_TIMING:
+    if (digitalRead(LIMIT_OPEN_PIN) == LOW)
+    {
+      unsigned long actual_travel_time = millis() - timer_start;
+      stop_movement(false);
+      gate_travel_time = actual_travel_time;
+      current_position = 1.0;
+      cover.setCurrentPosition(100);
+      save_state_to_fs();
+      Serial.printf("--- Calibration Complete! Time: %lu ms ---\n", gate_travel_time);
+      cal_state = CAL_DONE;
+    }
+    break;
+  case CAL_DONE:
+    cal_state = CAL_INACTIVE;
+    break;
+  default:
+    break;
+  }
+  if (cal_state != CAL_INACTIVE && cal_state != CAL_WAITING_AFTER_CLOSE && (millis() - timer_start > GATE_TIMEOUT))
+  {
+    Serial.println("Calibration FAILED: Timeout");
+    stop_movement(true);
+  }
+}
+
+// --- The rest of the functions are boilerplate and mostly unchanged ---
+void setup_wifi()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi...");
+  WiFi.waitForConnectResult();
+  Serial.println(" done.");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+void setup_pins()
+{
+  pinMode(RELAY_MOTOR_DIRECTION_PIN, OUTPUT);
+  pinMode(RELAY_MOTOR_ENABLE_PIN, OUTPUT);
+  pinMode(RELAY_INDICATOR_LIGHT_PIN, OUTPUT);
+  digitalWrite(RELAY_MOTOR_DIRECTION_PIN, LOW);
+  digitalWrite(RELAY_MOTOR_ENABLE_PIN, LOW);
+  digitalWrite(RELAY_INDICATOR_LIGHT_PIN, LOW);
+  pinMode(MANUAL_OPEN_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(MANUAL_CLOSE_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(MANUAL_STOP_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(MOVEMENT_INHIBIT_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_OPEN_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_CLOSE_PIN, INPUT_PULLUP);
+  pinMode(PHOTO_BARRIER_PIN, INPUT_PULLUP);
+}
+void handle_rf_signal()
+{
+  if (mySwitch.available())
+  {
+    unsigned long code = mySwitch.getReceivedValue();
+    mySwitch.resetAvailable();
+    if (code != 0)
+    {
+      last_rf_code_received = code;
+      char code_str[20];
+      sprintf(code_str, "%lu", last_rf_code_received);
+      rfCodeSensor.setValue(code_str);
+    }
+    if (cal_state != CAL_INACTIVE)
+      return;
+    switch (code)
+    {
+    case RF_GATE_OPEN_CODE:
+      start_opening();
+      break;
+    case RF_GATE_CLOSE_CODE:
+      start_closing();
+      break;
+    case RF_GATE_STOP_CODE:
+      stop_movement(true);
+      break;
+    }
+  }
+}
+void handle_manual_controls()
+{
+  static unsigned long last_press_time = 0;
+  if (millis() - last_press_time < 200)
+    return;
+  if (cal_state != CAL_INACTIVE)
+    return;
+  if (digitalRead(MANUAL_OPEN_BUTTON_PIN) == LOW)
+  {
+    last_press_time = millis();
+    start_opening();
+  }
+  if (digitalRead(MANUAL_CLOSE_BUTTON_PIN) == LOW)
+  {
+    last_press_time = millis();
+    start_closing();
+  }
+  if (digitalRead(MANUAL_STOP_BUTTON_PIN) == LOW)
+  {
+    last_press_time = millis();
+    stop_movement(true);
+  }
+}
+void handle_indicator_light()
+{
+  int flash_mode = (cal_state != CAL_INACTIVE) ? 2 : (current_operation == OPENING) ? 1
+                                                 : (current_operation == CLOSING)   ? 2
+                                                                                    : 0;
+  static unsigned long last_flash_time = 0;
+  static bool blink_state = false;
+  unsigned long flash_interval = (flash_mode == 1) ? 500 : 250;
+  bool current_light_state = digitalRead(RELAY_INDICATOR_LIGHT_PIN);
+  bool should_light_be_on = false;
+  if (flash_mode != 0)
+  {
+    if (millis() - last_flash_time > flash_interval)
+    {
+      last_flash_time = millis();
+      blink_state = !blink_state;
+    }
+    should_light_be_on = blink_state;
+  }
+  else
+  {
+    blink_state = false;
+  }
+  if (current_light_state != should_light_be_on)
+  {
+    digitalWrite(RELAY_INDICATOR_LIGHT_PIN, should_light_be_on);
+  }
+}
+void save_state_to_fs()
+{
+  File configFile = LittleFS.open("/settings.json", "w");
+  if (configFile)
+  {
+    StaticJsonDocument<256> doc;
+    doc["position"] = current_position;
+    doc["travelTime"] = gate_travel_time;
+    serializeJson(doc, configFile);
+    configFile.close();
+  }
+}
+void load_state_from_fs()
+{
+  if (LittleFS.exists("/settings.json"))
+  {
+    File configFile = LittleFS.open("/settings.json", "r");
+    if (configFile)
+    {
+      StaticJsonDocument<256> doc;
+      if (deserializeJson(doc, configFile) == DeserializationError::Ok)
+      {
+        current_position = doc["position"] | 0.0f;
+        gate_travel_time = doc["travelTime"] | 30000;
+      }
+      configFile.close();
+    }
+  }
+  else
+  {
+    save_state_to_fs();
+  }
+}
+void boot_check()
+{
+  bool corrected = false;
+  if (digitalRead(LIMIT_CLOSE_PIN) == LOW && current_position != 0.0)
+  {
+    current_position = 0.0;
+    corrected = true;
+  }
+  if (digitalRead(LIMIT_OPEN_PIN) == LOW && current_position != 1.0)
+  {
+    current_position = 1.0;
+    corrected = true;
+  }
+  if (corrected)
+  {
+    save_state_to_fs();
+  }
+  publish_all_states();
+}
+void publish_all_states()
+{
+  cover.setCurrentPosition(current_position * 100);
+  limitOpen.setState(digitalRead(LIMIT_OPEN_PIN) == LOW);
+  limitClose.setState(digitalRead(LIMIT_CLOSE_PIN) == LOW);
+  photoBarrier.setState(digitalRead(PHOTO_BARRIER_PIN) == LOW);
+  movementInhibit.setState(digitalRead(MOVEMENT_INHIBIT_PIN) == LOW);
+  char code_str[20];
+  sprintf(code_str, "%lu", last_rf_code_received);
+  rfCodeSensor.setValue(code_str);
+}
