@@ -9,6 +9,8 @@
 
 #include <ArduinoHA.h>
 #include <LittleFS.h>
+#include <stdlib.h> // For atoi
+#include <ArduinoJson.h>
 
 // ——— Pin definitions ———
 const int RELAY_MOTOR_DIRECTION_PIN = 1;
@@ -25,13 +27,24 @@ const int RF_RECEIVER_PIN = 21;
 
 // ——— Timing constants ———
 unsigned long MOTOR_DIRECTION_DELAY = 700;
-unsigned long OBSTACLE_CLEAR_RESUME_DELAY = 5000;
-unsigned long CALIBRATION_LONG_PRESS_TIME = 2000;
+unsigned long OBSTACLE_CLEAR_RESUME_DELAY = 8000;
+unsigned long CALIBRATION_LONG_PRESS_TIME = 8000;
 unsigned long WIFI_CONFIG_LONG_PRESS_TIME = 10000;
 unsigned long WIFI_RETRY_INTERVAL = 30000;
 
 // Persistent parameters
+// These are the default values. They will be overwritten by values from LittleFS if available.
 unsigned long gate_travel_time = 30000;
+char mqtt_server[40] = "192.168.100.18";
+char mqtt_port_str[6] = "1883";
+char mqtt_user[32] = "hassio";
+char mqtt_password[64] = "hassio";
+
+// --- WiFiManager Custom Parameters ---
+WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, sizeof(mqtt_server));
+WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", mqtt_port_str, sizeof(mqtt_port_str));
+WiFiManagerParameter custom_mqtt_user("user", "MQTT User", mqtt_user, sizeof(mqtt_user));
+WiFiManagerParameter custom_mqtt_password("password", "MQTT Password", mqtt_password, sizeof(mqtt_password));
 
 // --- Indicator light state ---
 unsigned long last_blink_time = 0;
@@ -45,92 +58,74 @@ bool indicator_light_state = false;
 #define BLINK_INTERVAL_CLOSING 500     // 0.5 second
 #define CALIBRATION_BLINK_INTERVAL 100 // 0.2 second for calibration
 
-// This function saves a single key-value pair to the LittleFS file.
-// It reads the existing file, updates the line with the matching key,
-// and rewrites the file.
-bool save_gate_param(const char *key, unsigned long value)
+void save_params()
 {
-  // Open the params file for reading
-  File f = LittleFS.open(PARAMS_FILE, "r");
-  String newContent = "";
-  bool found = false;
+  Serial.println("Saving configuration to LittleFS...");
+  JsonDocument doc;
 
-  // If the file exists, read it line by line
-  if (f)
+  doc["gate_travel_time"] = gate_travel_time;
+  doc["mqtt_server"] = mqtt_server;
+  doc["mqtt_port"] = mqtt_port_str;
+  doc["mqtt_user"] = mqtt_user;
+  doc["mqtt_password"] = mqtt_password;
+
+  File configFile = LittleFS.open(PARAMS_FILE, "w");
+  if (!configFile)
   {
-    while (f.available())
-    {
-      String line = f.readStringUntil('\n');
-      line.trim();
-      // Check if the line is the one we want to update
-      if (line.startsWith(key) && line.charAt(strlen(key)) == '=')
-      {
-        // It is, so write the new value
-        newContent += String(key) + "=" + String(value) + "\n";
-        found = true;
-      }
-      else if (line.length() > 0)
-      {
-        // It's not, so just copy the existing line
-        newContent += line + "\n";
-      }
-    }
-    f.close();
+    Serial.println("Failed to open config file for writing");
+    return;
   }
 
-  // If the key was not found in the file, add it to the end.
-  if (!found)
+  if (serializeJson(doc, configFile) == 0)
   {
-    newContent += String(key) + "=" + String(value) + "\n";
+    Serial.println("Failed to write to config file");
   }
-
-  // Open the file for writing (this will overwrite the old file)
-  f = LittleFS.open(PARAMS_FILE, "w");
-  if (!f)
+  else
   {
-    Serial.println("Failed to open params file for writing!");
-    return false;
+    Serial.println("Configuration saved successfully.");
   }
-  // Write the new content and close the file
-  f.print(newContent);
-  f.close();
-  Serial.printf("Saved %s = %lu to LittleFS.\n", key, value);
-  return true;
+  configFile.close();
 }
 
-// This function loads a single value from the file, identified by its key.
-// If the key is not found, it returns the provided default value.
-unsigned long load_gate_param(const char *key, unsigned long defaultValue)
+void load_params()
 {
-  File f = LittleFS.open(PARAMS_FILE, "r");
-  if (!f)
+  if (LittleFS.exists(PARAMS_FILE))
   {
-    // File doesn't exist, so return the default value.
-    return defaultValue;
-  }
-
-  while (f.available())
-  {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    // Check if the line starts with the key we are looking for
-    if (line.startsWith(key) && line.charAt(strlen(key)) == '=')
+    Serial.println("Reading configuration from LittleFS...");
+    File configFile = LittleFS.open(PARAMS_FILE, "r");
+    if (configFile)
     {
-      // Found the key, extract the value part of the string.
-      String valStr = line.substring(strlen(key) + 1);
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, configFile);
+      if (error)
+      {
+        Serial.print(F("deserializeJson() failed: "));
+        Serial.println(error.c_str());
+        return;
+      }
 
-      // --- FIXED: Use strtoul for safe conversion from String to unsigned long ---
-      unsigned long val = strtoul(valStr.c_str(), NULL, 10);
+      gate_travel_time = doc["gate_travel_time"] | gate_travel_time;
+      strncpy(mqtt_server, doc["mqtt_server"] | mqtt_server, sizeof(mqtt_server));
+      strncpy(mqtt_port_str, doc["mqtt_port"] | mqtt_port_str, sizeof(mqtt_port_str));
+      strncpy(mqtt_user, doc["mqtt_user"] | mqtt_user, sizeof(mqtt_user));
+      strncpy(mqtt_password, doc["mqtt_password"] | mqtt_password, sizeof(mqtt_password));
 
-      f.close();
-      // Return the loaded value if it's valid, otherwise return the default.
-      return val > 0 ? val : defaultValue;
+      Serial.println("Configuration loaded:");
+      Serial.printf(" - Travel Time: %lu\n", gate_travel_time);
+      Serial.printf(" - MQTT Server: %s\n", mqtt_server);
+      Serial.printf(" - MQTT Port: %s\n", mqtt_port_str);
+      Serial.printf(" - MQTT User: %s\n", mqtt_user);
+      // Do not print password for security
+
+      configFile.close();
     }
   }
-
-  // Key was not found in the file, close it and return the default.
-  f.close();
-  return defaultValue;
+  else
+  {
+    Serial.println("No configuration file found, using default values.");
+    // Optional: save defaults on first boot
+    save_params();
+  }
 }
 
 // ——— Library Objects ———
@@ -276,29 +271,24 @@ void close_button_pressed(Button2 &btn)
 void stop_button_pressed(Button2 &btn) { stop_movement(true); }
 void calibration_long_press(Button2 &btn) { start_calibration(); }
 // --- CORRECTED WiFi Config Portal Trigger ---
-void wifi_config_long_press(Button2 &btn)
-{
-  Serial.println("WiFi Config: Long press detected. Entering setup mode.");
-  Serial.println("Gate will be unresponsive for up to 3 minutes during setup.");
+void wifi_config_long_press(Button2 &btn) {
+    Serial.println("WiFi Config: Long press detected. Starting portal.");
+    Serial.println("Gate will be unresponsive for up to 3 minutes.");
 
-  // Set a timeout for the portal.
-  wm.setConfigPortalTimeout(180);
+    wm.setConfigPortalTimeout(180);
 
-  // This is a blocking call, but it's what we want for a dedicated setup mode.
-  // It will create an AP named "GateControllerAP" and wait for the user.
-  // It returns true if connection is successful, false if it times out.
-  if (wm.startConfigPortal("GateControllerAP"))
-  {
-    Serial.println("WiFi Config: Success! Connected to new network.");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-  }
-  else
-  {
-    Serial.println("WiFi Config: Failed to connect or timed out.");
-  }
+    // This call is blocking. The save callback will handle saving the parameters.
+    if (!wm.startConfigPortal("GateControllerAP")) {
+        Serial.println("WiFi Config: Portal timed out. No new WiFi connection.");
+    } else {
+        Serial.println("WiFi Config: Portal exited successfully (new credentials may have been saved).");
+    }
 
-  Serial.println("Exiting setup mode, returning to normal operation.");
+    // After the portal is done, a restart is always the safest way to ensure a clean state
+    // and apply any new WiFi credentials or saved parameters.
+    Serial.println("Exiting config mode. Restarting device...");
+    delay(1000);
+    ESP.restart();
 }
 
 // =================================================================
@@ -346,7 +336,7 @@ void setup()
     return;
   }
 
-  gate_travel_time = load_gate_param("gate_travel_time", gate_travel_time);
+  load_params();
 
   byte mac[6];
   WiFi.macAddress(mac);
@@ -394,6 +384,26 @@ void setup()
   buttonOpen.begin(MANUAL_OPEN_BUTTON_PIN, INPUT_PULLUP, true);
   buttonClose.begin(MANUAL_CLOSE_BUTTON_PIN, INPUT_PULLUP, true);
   buttonStop.begin(MANUAL_STOP_BUTTON_PIN, INPUT_PULLUP, true);
+
+  wm.addParameter(&custom_mqtt_server);
+  wm.addParameter(&custom_mqtt_port);
+  wm.addParameter(&custom_mqtt_user);
+  wm.addParameter(&custom_mqtt_password);
+
+    // --- (FIX) Define a callback that is triggered when WiFiManager saves configuration ---
+    // This is the key to reliably saving parameters, as it runs *before* the device restarts.
+    wm.setSaveConfigCallback([]() {
+        Serial.println("SaveConfigCallback triggered. Saving custom parameters...");
+        // Retrieve values from the parameter objects and store them in our global variables
+        strncpy(mqtt_server, custom_mqtt_server.getValue(), sizeof(mqtt_server));
+        strncpy(mqtt_port_str, custom_mqtt_port.getValue(), sizeof(mqtt_port_str));
+        strncpy(mqtt_user, custom_mqtt_user.getValue(), sizeof(mqtt_user));
+        strncpy(mqtt_password, custom_mqtt_password.getValue(), sizeof(mqtt_password));
+
+        // Now, explicitly save these global variables to LittleFS
+        save_params();
+    });
+
   buttonOpen.setPressedHandler(open_button_pressed);
   buttonClose.setPressedHandler(close_button_pressed);
   buttonStop.setPressedHandler(stop_button_pressed);
@@ -447,7 +457,15 @@ void setup()
 
   // 1) Configure MQTT → broker parameters & credentials
   //    This does *not* block; first connect attempt happens in mqtt.loop().
-  mqtt.begin(MQTT_SERVER, MQTT_USER, MQTT_PASSWORD);
+
+  //Serial print mqtt parameters
+  Serial.println("MQTT Configuration:");
+  Serial.printf(" - Server: %s\n", mqtt_server);
+  Serial.printf(" - Port: %s\n", mqtt_port_str);
+  Serial.printf(" - User: %s\n", mqtt_user);  
+  
+  uint16_t port = atoi(mqtt_port_str);
+  mqtt.begin(mqtt_server, port, mqtt_user, mqtt_password);
 }
 
 // ——— Main loop ———
@@ -945,9 +963,9 @@ void handle_calibration()
       Serial.println("--- Calibration Complete ---");
       Serial.printf("New gate travel time: %lu ms\n", gate_travel_time);
       Serial.println("Position has been set to OPEN (1.0).");
-      // **persist the new travel-time**
-      save_gate_param("gate_travel_time", gate_travel_time);
+      save_params();
       cal_state = CAL_INACTIVE;
+      publish_all_states();
     }
     break;
   case CAL_INACTIVE:
