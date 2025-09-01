@@ -36,6 +36,9 @@ unsigned long CALIBRATION_LONG_PRESS_TIME = 8000;
 unsigned long WIFI_CONFIG_LONG_PRESS_TIME = 10000;
 unsigned long WIFI_RETRY_INTERVAL = 30000;
 
+// 2025 09 01
+constexpr unsigned long OBSTACLE_REVERSE_CLEAR_DELAY = 2000; // 2 seconds
+
 // Persistent parameters
 // These are the default values. They will be overwritten by values from LittleFS if available.
 unsigned long gate_travel_time = 30000; //MS
@@ -43,6 +46,14 @@ char mqtt_server[40] = "192.168.100.18";
 char mqtt_port_str[6] = "1883";
 char mqtt_user[32] = "hassio";
 char mqtt_password[64] = "hassio";
+// 2025 09 01
+bool smart_photobarrier_mode = false; // Default to false (the original safe mode)
+
+
+// 2025 09 01
+bool stop_after_clear_countdown_active = false;
+unsigned long path_cleared_while_reversing_time = 0;
+
 
 // --- WiFiManager Custom Parameters ---
 WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, sizeof(mqtt_server));
@@ -72,6 +83,7 @@ void save_params()
   doc["mqtt_port"] = mqtt_port_str;
   doc["mqtt_user"] = mqtt_user;
   doc["mqtt_password"] = mqtt_password;
+  doc["smart_photo_mode"] = smart_photobarrier_mode;
 
   File configFile = LittleFS.open(PARAMS_FILE, "w");
   if (!configFile)
@@ -113,9 +125,13 @@ void load_params()
       strncpy(mqtt_port_str, doc["mqtt_port"] | mqtt_port_str, sizeof(mqtt_port_str));
       strncpy(mqtt_user, doc["mqtt_user"] | mqtt_user, sizeof(mqtt_user));
       strncpy(mqtt_password, doc["mqtt_password"] | mqtt_password, sizeof(mqtt_password));
+      smart_photobarrier_mode = doc["smart_photo_mode"] | smart_photobarrier_mode; // <-- NEW
+
 
       Serial.println("Configuration loaded:");
       Serial.printf(" - Travel Time: %lu\n", gate_travel_time);
+      Serial.printf(" - Smart Photo Mode: %s\n", smart_photobarrier_mode ? "Enabled" : "Disabled");
+
       Serial.printf(" - MQTT Server: %s\n", mqtt_server);
       Serial.printf(" - MQTT Port: %s\n", mqtt_port_str);
       Serial.printf(" - MQTT User: %s\n", mqtt_user);
@@ -150,6 +166,7 @@ HAButton moveTo50Button("sliding_gate_move_to_50"); // <-- NEW: HA Button for 50
 HASensor gateState("sliding_gate_state");
 // ← new!
 HASensor travelTimeSensor("sliding_gate_travel_time");
+HASwitch photoModeSwitch("sliding_gate_smart_photo_mode");
 
 HAButton openButtonHA("sliding_gate_open_button");
 HAButton closeButtonHA("sliding_gate_close_button");
@@ -160,7 +177,8 @@ enum CoverOperation
 {
   IDLE,
   OPENING,
-  CLOSING
+  CLOSING,
+  REVERSING_FROM_OBSTACLE 
 };
 enum CalibrationState
 {
@@ -214,6 +232,7 @@ void move_to_position(float new_target);  // <-- NEW
 void onOpenCommand(HAButton *sender);
 void onCloseCommand(HAButton *sender);
 void onStopCommand(HAButton *sender);
+void onPhotoModeCommand(bool state, HASwitch* sender);
 
 //Push states to ArduinoHA 
 void publish_all_states()
@@ -251,6 +270,9 @@ void publish_all_states()
   {
     gateState.setValue("stopped");
   }
+
+  //publish the state of our new switch
+  photoModeSwitch.setState(smart_photobarrier_mode);
 
   // limitOpen.setState(digitalRead(LIMIT_OPEN_PIN) == LOW);
   // limitClose.setState(digitalRead(LIMIT_CLOSE_PIN) == LOW);
@@ -448,6 +470,11 @@ void setup()
   stopButtonHA.setIcon("mdi:stop-circle-outline");
   stopButtonHA.onCommand(onStopCommand);
 
+
+  photoModeSwitch.setName("Smart Photo Barrier Mode");
+  photoModeSwitch.setIcon("mdi:camera-iris");
+  photoModeSwitch.onCommand(onPhotoModeCommand);
+
   pinMode(RF_RECEIVER_PIN, INPUT);
   mySwitch.enableReceive(RF_RECEIVER_PIN);
 
@@ -518,6 +545,14 @@ void loop()
       update_gate_position();
     }
   }
+}
+
+void onPhotoModeCommand(bool state, HASwitch* sender)
+{
+    smart_photobarrier_mode = state;
+    Serial.printf("Smart Photo Barrier Mode set to: %s\n", state ? "ON" : "OFF");
+    sender->setState(state); // Immediately update HA with the new state
+    save_params(); // Save the new setting
 }
 
 void onOpenCommand(HAButton *sender)
@@ -775,6 +810,8 @@ void stop_movement(bool triggered_by_user)
   blink_interval = 0; // Stop blinking
   current_operation = IDLE;
   motor_relay_state = R_OFF;
+  stop_after_clear_countdown_active = false; // <-- NEW: Reset our countdown flag
+
 
   if (WiFi.status() == WL_CONNECTED)
   {
@@ -839,9 +876,9 @@ void update_gate_position()
     target_position = -1.0; // <-- NEW: Clear target at hard limit
   }
 }
-
+/*
 void handle_safety_sensors()
-{ /* ... unchanged ... */
+{ 
   if (current_operation != IDLE && digitalRead(MOVEMENT_INHIBIT_PIN) == LOW)
   {
     Serial.println("Safety: Movement inhibited!");
@@ -862,6 +899,7 @@ void handle_safety_sensors()
     current_position = 0.0f;
     target_position = -1.0; // <-- NEW: Clear target at hard limit
   }
+
   bool is_path_blocked = (digitalRead(PHOTO_BARRIER_PIN) == LOW);
   static bool was_path_blocked = false;
   if (is_path_blocked && !was_path_blocked && current_operation == CLOSING)
@@ -910,6 +948,115 @@ void handle_safety_sensors()
   }
   was_path_blocked = is_path_blocked;
 }
+*/
+// --- REPLACE the existing handle_safety_sensors() function with this ---
+void handle_safety_sensors()
+{
+  /* ... (The first two 'if' blocks for MOVEMENT_INHIBIT and LIMIT_SWITCHES remain unchanged) ... */
+  if (current_operation != IDLE && digitalRead(MOVEMENT_INHIBIT_PIN) == LOW)
+  {
+    Serial.println("Safety: Movement inhibited!");
+    stop_movement(true);
+    return;
+  }
+  if (current_operation == OPENING && digitalRead(LIMIT_OPEN_PIN) == LOW)
+  {
+    Serial.println("Limit: OPEN reached");
+    stop_movement(false);
+    current_position = 1.0f;
+    target_position = -1.0;
+  }
+  if (current_operation == CLOSING && digitalRead(LIMIT_CLOSE_PIN) == LOW)
+  {
+    Serial.println("Limit: CLOSE reached");
+    stop_movement(false);
+    current_position = 0.0f;
+    target_position = -1.0;
+  }
+
+  // --- MODIFIED Photo Barrier Logic ---
+  bool is_path_blocked = (digitalRead(PHOTO_BARRIER_PIN) == LOW);
+  static bool was_path_blocked = false;
+
+  // 1. Obstacle is detected while closing
+  if (is_path_blocked && !was_path_blocked && current_operation == CLOSING)
+  {
+    Serial.println("Photo Barrier: Obstacle detected.");
+    stop_movement(false);
+    auto_resume_is_armed = true;
+    resume_countdown_is_active = false;
+    target_position = -1.0;
+
+    if (smart_photobarrier_mode) {
+        Serial.println("Smart Mode: Reversing until path is clear...");
+        current_operation = REVERSING_FROM_OBSTACLE; // Use the new state
+        if (WiFi.status() == WL_CONNECTED) {
+            cover.setState(HACover::StateOpening); // Appear as "opening" in HA
+        }
+        execute_open_sequence();
+    } else {
+        Serial.println("Safe Mode: Reversing fully.");
+        execute_open_sequence(); // Original behavior
+    }
+  }
+
+  // 2. NEW LOGIC: Handle the smart reversal state
+  if (current_operation == REVERSING_FROM_OBSTACLE)
+  {
+      // If the path becomes clear, start a 2-second timer to stop.
+      if (!is_path_blocked && !stop_after_clear_countdown_active) {
+          Serial.printf("Path is clear. Stopping in %lu ms.\n", OBSTACLE_REVERSE_CLEAR_DELAY);
+          stop_after_clear_countdown_active = true;
+          path_cleared_while_reversing_time = millis();
+      }
+
+      // If the timer is running and has expired, stop the gate.
+      if (stop_after_clear_countdown_active && (millis() - path_cleared_while_reversing_time >= OBSTACLE_REVERSE_CLEAR_DELAY)) {
+          Serial.println("Reversal complete.");
+          stop_movement(false); // This will set state to IDLE
+      }
+  }
+
+  // 3. MODIFIED Auto-resume logic (works for both modes now)
+  if (auto_resume_is_armed)
+  {
+    // This now triggers when the gate is idle, regardless of position
+    if (current_operation == IDLE)
+    {
+      if (!is_path_blocked)
+      {
+        Serial.printf("Path is clear. Starting %lu sec auto-close timer.\n", OBSTACLE_CLEAR_RESUME_DELAY / 1000);
+        resume_countdown_is_active = true;
+        path_cleared_time = millis();
+        auto_resume_is_armed = false; // Disarm here
+      }
+    }
+  }
+
+  // 4. Countdown logic (remains mostly the same)
+  if (resume_countdown_is_active)
+  {
+    if (current_operation != IDLE) {
+        resume_countdown_is_active = false;
+        return;
+    }
+    if (millis() - path_cleared_time >= OBSTACLE_CLEAR_RESUME_DELAY)
+    {
+      if (is_path_blocked) {
+        Serial.println("Photo Barrier: Path re-blocked. Resetting timer.");
+        path_cleared_time = millis();
+      } else {
+        Serial.println("Photo Barrier: Timer expired. Resuming close operation.");
+        resume_countdown_is_active = false;
+        start_closing();
+      }
+    }
+  }
+  was_path_blocked = is_path_blocked;
+}
+
+
+
 void start_calibration()
 { /* ... unchanged ... */
   if (current_operation != IDLE || cal_state != CAL_INACTIVE)
@@ -919,7 +1066,21 @@ void start_calibration()
   blink_interval = CALIBRATION_BLINK_INTERVAL; // Set fast blink for calibration
 }
 void handle_calibration()
-{ /* ... unchanged ... */
+{ 
+    // 2025-09 01
+    // --- IMPROVEMENT: Add safety checks inside calibration loop ---
+  if (digitalRead(MOVEMENT_INHIBIT_PIN) == LOW) {
+      Serial.println("Calibration cancelled: Movement Inhibited.");
+      stop_movement(true); // User-triggered stop to cancel calibration
+      return;
+  }
+  // During the initial close, an obstacle is a critical failure.
+  if (cal_state == CAL_CLOSING_TO_START && digitalRead(PHOTO_BARRIER_PIN) == LOW) {
+      Serial.println("Calibration cancelled: Obstacle detected during initial close.");
+      stop_movement(true);
+      return;
+  }
+
   switch (cal_state)
   {
   case CAL_CLOSING_TO_START:
