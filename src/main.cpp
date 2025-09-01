@@ -16,16 +16,20 @@
 const int RELAY_MOTOR_DIRECTION_PIN = 1;
 const int RELAY_MOTOR_ENABLE_PIN = 3;
 const int RELAY_INDICATOR_LIGHT_PIN = 4;
+
 const int MANUAL_OPEN_BUTTON_PIN = 5;
 const int MANUAL_CLOSE_BUTTON_PIN = 6;
 const int MANUAL_STOP_BUTTON_PIN = 7;
+
 const int MOVEMENT_INHIBIT_PIN = 8;
+const int PHOTO_BARRIER_PIN = 2;
+
+
 const int LIMIT_OPEN_PIN = 10;
 const int LIMIT_CLOSE_PIN = 20;
-const int PHOTO_BARRIER_PIN = 2;
 const int RF_RECEIVER_PIN = 21;
 
-// ——— Timing constants ———
+// ——— Timing constants in MS ———
 unsigned long MOTOR_DIRECTION_DELAY = 700;
 unsigned long OBSTACLE_CLEAR_RESUME_DELAY = 8000;
 unsigned long CALIBRATION_LONG_PRESS_TIME = 8000;
@@ -34,7 +38,7 @@ unsigned long WIFI_RETRY_INTERVAL = 30000;
 
 // Persistent parameters
 // These are the default values. They will be overwritten by values from LittleFS if available.
-unsigned long gate_travel_time = 30000;
+unsigned long gate_travel_time = 30000; //MS
 char mqtt_server[40] = "192.168.100.18";
 char mqtt_port_str[6] = "1883";
 char mqtt_user[32] = "hassio";
@@ -211,6 +215,7 @@ void onOpenCommand(HAButton *sender);
 void onCloseCommand(HAButton *sender);
 void onStopCommand(HAButton *sender);
 
+//Push states to ArduinoHA 
 void publish_all_states()
 {
   cover.setCurrentPosition(current_position * 100);
