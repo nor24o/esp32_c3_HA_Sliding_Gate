@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <RCSwitch.h>
 #include <Button2.h>
-#include "secrets.h"
 
 // --- WiFi Libraries ---
 #include <WiFi.h>
@@ -12,48 +11,41 @@
 #include <stdlib.h> // For atoi
 #include <ArduinoJson.h>
 
+#include "SerialMirror.hpp" // Include SerialMirror class and LOG_PRINT macros
+
 // ——— Pin definitions ———
 const int RELAY_MOTOR_DIRECTION_PIN = 1;
 const int RELAY_MOTOR_ENABLE_PIN = 3;
 const int RELAY_INDICATOR_LIGHT_PIN = 4;
-
 const int MANUAL_OPEN_BUTTON_PIN = 5;
 const int MANUAL_CLOSE_BUTTON_PIN = 6;
 const int MANUAL_STOP_BUTTON_PIN = 7;
-
 const int MOVEMENT_INHIBIT_PIN = 8;
-const int PHOTO_BARRIER_PIN = 2;
-
-
 const int LIMIT_OPEN_PIN = 10;
-const int LIMIT_CLOSE_PIN = 20;
+const int LIMIT_CLOSE_PIN = 17;
+const int PHOTO_BARRIER_PIN = 2;
 const int RF_RECEIVER_PIN = 21;
 
-// ——— Timing constants in MS ———
+// ——— Timing constants ———
 unsigned long MOTOR_DIRECTION_DELAY = 700;
 unsigned long OBSTACLE_CLEAR_RESUME_DELAY = 8000;
 unsigned long CALIBRATION_LONG_PRESS_TIME = 8000;
 unsigned long WIFI_CONFIG_LONG_PRESS_TIME = 10000;
 unsigned long WIFI_RETRY_INTERVAL = 30000;
 
-// 2025 09 01
-constexpr unsigned long OBSTACLE_REVERSE_CLEAR_DELAY = 2000; // 2 seconds
-
 // Persistent parameters
 // These are the default values. They will be overwritten by values from LittleFS if available.
-unsigned long gate_travel_time = 30000; //MS
-char mqtt_server[40] = "192.168.100.18";
+unsigned long gate_travel_time = 30000;
+char mqtt_server[40] = "192.168.1.8";
 char mqtt_port_str[6] = "1883";
-char mqtt_user[32] = "hassio";
-char mqtt_password[64] = "hassio";
-// 2025 09 01
-bool smart_photobarrier_mode = false; // Default to false (the original safe mode)
+char mqtt_user[32] = "admin";
+char mqtt_password[64] = "admin";
 
-
-// 2025 09 01
-bool stop_after_clear_countdown_active = false;
-unsigned long path_cleared_while_reversing_time = 0;
-
+// Replace these with the codes from your 433MHz remote
+#define RF_GATE_OPEN_CODE 1234567
+#define RF_GATE_CLOSE_CODE 7654321
+#define RF_GATE_STOP_CODE 1111111
+#define RF_GATE_POS50_CODE 2222222
 
 // --- WiFiManager Custom Parameters ---
 WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, sizeof(mqtt_server));
@@ -75,7 +67,7 @@ bool indicator_light_state = false;
 
 void save_params()
 {
-  Serial.println("Saving configuration to LittleFS...");
+  LOG_PRINTLN("Saving configuration to LittleFS...");
   JsonDocument doc;
 
   doc["gate_travel_time"] = gate_travel_time;
@@ -83,22 +75,21 @@ void save_params()
   doc["mqtt_port"] = mqtt_port_str;
   doc["mqtt_user"] = mqtt_user;
   doc["mqtt_password"] = mqtt_password;
-  doc["smart_photo_mode"] = smart_photobarrier_mode;
 
   File configFile = LittleFS.open(PARAMS_FILE, "w");
   if (!configFile)
   {
-    Serial.println("Failed to open config file for writing");
+    LOG_PRINTLN("Failed to open config file for writing");
     return;
   }
 
   if (serializeJson(doc, configFile) == 0)
   {
-    Serial.println("Failed to write to config file");
+    LOG_PRINTLN("Failed to write to config file");
   }
   else
   {
-    Serial.println("Configuration saved successfully.");
+    LOG_PRINTLN("Configuration saved successfully.");
   }
   configFile.close();
 }
@@ -107,7 +98,7 @@ void load_params()
 {
   if (LittleFS.exists(PARAMS_FILE))
   {
-    Serial.println("Reading configuration from LittleFS...");
+    LOG_PRINTLN("Reading configuration from LittleFS...");
     File configFile = LittleFS.open(PARAMS_FILE, "r");
     if (configFile)
     {
@@ -115,8 +106,8 @@ void load_params()
       DeserializationError error = deserializeJson(doc, configFile);
       if (error)
       {
-        Serial.print(F("deserializeJson() failed: "));
-        Serial.println(error.c_str());
+        LOG_PRINT(F("deserializeJson() failed: "));
+        LOG_PRINTLN(error.c_str());
         return;
       }
 
@@ -125,16 +116,12 @@ void load_params()
       strncpy(mqtt_port_str, doc["mqtt_port"] | mqtt_port_str, sizeof(mqtt_port_str));
       strncpy(mqtt_user, doc["mqtt_user"] | mqtt_user, sizeof(mqtt_user));
       strncpy(mqtt_password, doc["mqtt_password"] | mqtt_password, sizeof(mqtt_password));
-      smart_photobarrier_mode = doc["smart_photo_mode"] | smart_photobarrier_mode; // <-- NEW
 
-
-      Serial.println("Configuration loaded:");
-      Serial.printf(" - Travel Time: %lu\n", gate_travel_time);
-      Serial.printf(" - Smart Photo Mode: %s\n", smart_photobarrier_mode ? "Enabled" : "Disabled");
-
-      Serial.printf(" - MQTT Server: %s\n", mqtt_server);
-      Serial.printf(" - MQTT Port: %s\n", mqtt_port_str);
-      Serial.printf(" - MQTT User: %s\n", mqtt_user);
+      LOG_PRINTLN("Configuration loaded:");
+      LOG_PRINTF(" - Travel Time: %lu\n", gate_travel_time);
+      LOG_PRINTF(" - MQTT Server: %s\n", mqtt_server);
+      LOG_PRINTF(" - MQTT Port: %s\n", mqtt_port_str);
+      LOG_PRINTF(" - MQTT User: %s\n", mqtt_user);
       // Do not print password for security
 
       configFile.close();
@@ -142,7 +129,7 @@ void load_params()
   }
   else
   {
-    Serial.println("No configuration file found, using default values.");
+    LOG_PRINTLN("No configuration file found, using default values.");
     // Optional: save defaults on first boot
     save_params();
   }
@@ -154,6 +141,7 @@ Button2 buttonOpen;
 Button2 buttonClose;
 Button2 buttonStop;
 WiFiManager wm;
+WiFiServer telnetServer(23);
 
 // 2) ArduinoHA objects
 WiFiClient wifiClient;
@@ -164,9 +152,9 @@ HASensor rfCodeSensor("sliding_gate_last_rf_code");
 HAButton calibrateButton("sliding_gate_calibrate");
 HAButton moveTo50Button("sliding_gate_move_to_50"); // <-- NEW: HA Button for 50% position
 HASensor gateState("sliding_gate_state");
+HASensor gateIP("sliding_gate_IP");
 // ← new!
 HASensor travelTimeSensor("sliding_gate_travel_time");
-HASwitch photoModeSwitch("sliding_gate_smart_photo_mode");
 
 HAButton openButtonHA("sliding_gate_open_button");
 HAButton closeButtonHA("sliding_gate_close_button");
@@ -177,8 +165,7 @@ enum CoverOperation
 {
   IDLE,
   OPENING,
-  CLOSING,
-  REVERSING_FROM_OBSTACLE 
+  CLOSING
 };
 enum CalibrationState
 {
@@ -232,9 +219,7 @@ void move_to_position(float new_target);  // <-- NEW
 void onOpenCommand(HAButton *sender);
 void onCloseCommand(HAButton *sender);
 void onStopCommand(HAButton *sender);
-void onPhotoModeCommand(bool state, HASwitch* sender);
 
-//Push states to ArduinoHA 
 void publish_all_states()
 {
   cover.setCurrentPosition(current_position * 100);
@@ -271,9 +256,6 @@ void publish_all_states()
     gateState.setValue("stopped");
   }
 
-  //publish the state of our new switch
-  photoModeSwitch.setState(smart_photobarrier_mode);
-
   // limitOpen.setState(digitalRead(LIMIT_OPEN_PIN) == LOW);
   // limitClose.setState(digitalRead(LIMIT_CLOSE_PIN) == LOW);
   // photoBarrier.setState(digitalRead(PHOTO_BARRIER_PIN) == LOW);
@@ -282,6 +264,8 @@ void publish_all_states()
   // char code_str[20];
   // sprintf(code_str, "%lu", last_rf_code_received);
   // rfCodeSensor.setValue(code_str);
+
+  gateIP.setValue(WiFi.localIP().toString().c_str());
 }
 
 // ——— Button Callback Functions ———
@@ -298,24 +282,28 @@ void close_button_pressed(Button2 &btn)
 void stop_button_pressed(Button2 &btn) { stop_movement(true); }
 void calibration_long_press(Button2 &btn) { start_calibration(); }
 // --- CORRECTED WiFi Config Portal Trigger ---
-void wifi_config_long_press(Button2 &btn) {
-    Serial.println("WiFi Config: Long press detected. Starting portal.");
-    Serial.println("Gate will be unresponsive for up to 3 minutes.");
+void wifi_config_long_press(Button2 &btn)
+{
+  LOG_PRINTLN("WiFi Config: Long press detected. Starting portal.");
+  LOG_PRINTLN("Gate will be unresponsive for up to 3 minutes.");
 
-    wm.setConfigPortalTimeout(180);
+  wm.setConfigPortalTimeout(180);
 
-    // This call is blocking. The save callback will handle saving the parameters.
-    if (!wm.startConfigPortal("GateControllerAP")) {
-        Serial.println("WiFi Config: Portal timed out. No new WiFi connection.");
-    } else {
-        Serial.println("WiFi Config: Portal exited successfully (new credentials may have been saved).");
-    }
+  // This call is blocking. The save callback will handle saving the parameters.
+  if (!wm.startConfigPortal("GateControllerAP"))
+  {
+    LOG_PRINTLN("WiFi Config: Portal timed out. No new WiFi connection.");
+  }
+  else
+  {
+    LOG_PRINTLN("WiFi Config: Portal exited successfully (new credentials may have been saved).");
+  }
 
-    // After the portal is done, a restart is always the safest way to ensure a clean state
-    // and apply any new WiFi credentials or saved parameters.
-    Serial.println("Exiting config mode. Restarting device...");
-    delay(1000);
-    ESP.restart();
+  // After the portal is done, a restart is always the safest way to ensure a clean state
+  // and apply any new WiFi credentials or saved parameters.
+  LOG_PRINTLN("Exiting config mode. Restarting device...");
+  delay(1000);
+  ESP.restart();
 }
 
 // =================================================================
@@ -326,7 +314,7 @@ void onCoverCommand(HACover::CoverCommand cmd, HACover *sender)
   // FIX: Add guard to prevent normal commands during calibration
   if (cal_state != CAL_INACTIVE)
   {
-    Serial.println("Ignoring command: Calibration in progress.");
+    LOG_PRINTLN("Ignoring command: Calibration in progress.");
     return;
   }
   // Clear any specific position target when using standard open/close/stop
@@ -334,15 +322,15 @@ void onCoverCommand(HACover::CoverCommand cmd, HACover *sender)
   switch (cmd)
   {
   case HACover::CommandOpen:
-    Serial.println("Received OPEN command from HA");
+    LOG_PRINTLN("Received OPEN command from HA");
     start_opening();
     break;
   case HACover::CommandClose:
-    Serial.println("Received CLOSE command from HA");
+    LOG_PRINTLN("Received CLOSE command from HA");
     start_closing();
     break;
   case HACover::CommandStop:
-    Serial.println("Received STOP command from HA");
+    LOG_PRINTLN("Received STOP command from HA");
     stop_movement(true);
     break;
   }
@@ -353,13 +341,13 @@ void setup()
 {
   Serial.begin(115200);
 
-  Serial.println("\nSliding Gate Controller Starting");
+  LOG_PRINTLN("\nSliding Gate Controller Starting");
 
   // Mount filesystem & init pins
   // Mount filesystem
   if (!LittleFS.begin(true))
   {
-    Serial.println("LittleFS Mount Failed!");
+    LOG_PRINTLN("LittleFS Mount Failed!");
     return;
   }
 
@@ -395,17 +383,17 @@ void setup()
   if (digitalRead(LIMIT_OPEN_PIN) == LOW)
   {
     current_position = 1.0;
-    Serial.println("Initial state: Gate is OPEN.");
+    LOG_PRINTLN("Initial state: Gate is OPEN.");
   }
   else if (digitalRead(LIMIT_CLOSE_PIN) == LOW)
   {
     current_position = 0.0;
-    Serial.println("Initial state: Gate is CLOSED.");
+    LOG_PRINTLN("Initial state: Gate is CLOSED.");
   }
   else
   {
     current_position = 0.0;
-    Serial.println("Initial state: Gate position UNKNOWN (assuming CLOSED).");
+    LOG_PRINTLN("Initial state: Gate position UNKNOWN (assuming CLOSED).");
   }
 
   buttonOpen.begin(MANUAL_OPEN_BUTTON_PIN, INPUT_PULLUP, true);
@@ -417,10 +405,11 @@ void setup()
   wm.addParameter(&custom_mqtt_user);
   wm.addParameter(&custom_mqtt_password);
 
-    // --- (FIX) Define a callback that is triggered when WiFiManager saves configuration ---
-    // This is the key to reliably saving parameters, as it runs *before* the device restarts.
-    wm.setSaveConfigCallback([]() {
-        Serial.println("SaveConfigCallback triggered. Saving custom parameters...");
+  // --- (FIX) Define a callback that is triggered when WiFiManager saves configuration ---
+  // This is the key to reliably saving parameters, as it runs *before* the device restarts.
+  wm.setSaveConfigCallback([]()
+                           {
+        LOG_PRINTLN("SaveConfigCallback triggered. Saving custom parameters...");
         // Retrieve values from the parameter objects and store them in our global variables
         strncpy(mqtt_server, custom_mqtt_server.getValue(), sizeof(mqtt_server));
         strncpy(mqtt_port_str, custom_mqtt_port.getValue(), sizeof(mqtt_port_str));
@@ -428,8 +417,7 @@ void setup()
         strncpy(mqtt_password, custom_mqtt_password.getValue(), sizeof(mqtt_password));
 
         // Now, explicitly save these global variables to LittleFS
-        save_params();
-    });
+        save_params(); });
 
   buttonOpen.setPressedHandler(open_button_pressed);
   buttonClose.setPressedHandler(close_button_pressed);
@@ -446,6 +434,10 @@ void setup()
 
   gateState.setName("Gate State");
   gateState.setIcon("mdi:gate");
+
+  gateIP.setName("Gate IP");
+  gateIP.setUnitOfMeasurement("IP");
+  gateIP.setIcon("mdi:ip");
 
   // ← configure the new travel‐time sensor:
   travelTimeSensor.setName("Gate Travel Time");
@@ -470,11 +462,6 @@ void setup()
   stopButtonHA.setIcon("mdi:stop-circle-outline");
   stopButtonHA.onCommand(onStopCommand);
 
-
-  photoModeSwitch.setName("Smart Photo Barrier Mode");
-  photoModeSwitch.setIcon("mdi:camera-iris");
-  photoModeSwitch.onCommand(onPhotoModeCommand);
-
   pinMode(RF_RECEIVER_PIN, INPUT);
   mySwitch.enableReceive(RF_RECEIVER_PIN);
 
@@ -483,21 +470,25 @@ void setup()
   WiFi.setAutoReconnect(true); // This is the key!
   WiFi.begin();
 
-  Serial.println("Setup complete.");
-  Serial.println("Hold STOP for 2s to calibrate.");
-  Serial.println("Hold OPEN for 2s for WiFi setup.");
+  LOG_PRINTLN("Setup complete.");
+  LOG_PRINTLN("Hold STOP for 2s to calibrate.");
+  LOG_PRINTLN("Hold OPEN for 2s for WiFi setup.");
 
   // 1) Configure MQTT → broker parameters & credentials
   //    This does *not* block; first connect attempt happens in mqtt.loop().
 
-  //Serial print mqtt parameters
-  Serial.println("MQTT Configuration:");
-  Serial.printf(" - Server: %s\n", mqtt_server);
-  Serial.printf(" - Port: %s\n", mqtt_port_str);
-  Serial.printf(" - User: %s\n", mqtt_user);  
-  
+  // Serial print mqtt parameters
+  LOG_PRINTLN("MQTT Configuration:");
+  LOG_PRINTF(" - Server: %s\n", mqtt_server);
+  LOG_PRINTF(" - Port: %s\n", mqtt_port_str);
+  LOG_PRINTF(" - User: %s\n", mqtt_user);
+
   uint16_t port = atoi(mqtt_port_str);
   mqtt.begin(mqtt_server, port, mqtt_user, mqtt_password);
+
+  telnetServer.begin();
+  LOG_PRINTLN("Telnet server started. Logger is active.");
+  gateIP.setValue(WiFi.localIP().toString().c_str());
 }
 
 // ——— Main loop ———
@@ -512,6 +503,17 @@ void loop()
     //  • notice if the socket dropped
     //  • automatically reconnect every 10 s (ReconnectInterval) if needed
     mqtt.loop(); // ← critical for auto-reconnect :contentReference[oaicite:0]{index=0}
+
+    if (telnetServer.hasClient())
+    {
+      if (!telnetClient || !telnetClient.connected())
+      {
+        if (telnetClient)
+          telnetClient.stop();
+        telnetClient = telnetServer.accept();
+        LOG_PRINTLN("New Telnet client connected!");
+      }
+    }
   }
 
   // send every 3 seconds
@@ -547,44 +549,36 @@ void loop()
   }
 }
 
-void onPhotoModeCommand(bool state, HASwitch* sender)
-{
-    smart_photobarrier_mode = state;
-    Serial.printf("Smart Photo Barrier Mode set to: %s\n", state ? "ON" : "OFF");
-    sender->setState(state); // Immediately update HA with the new state
-    save_params(); // Save the new setting
-}
-
 void onOpenCommand(HAButton *sender)
 {
-  Serial.println("Received OPEN command from HA Button");
+  LOG_PRINTLN("Received OPEN command from HA Button");
   target_position = -1.0;
   start_opening();
 }
 
 void onCloseCommand(HAButton *sender)
 {
-  Serial.println("Received CLOSE command from HA Button");
+  LOG_PRINTLN("Received CLOSE command from HA Button");
   target_position = -1.0;
   start_closing();
 }
 
 void onStopCommand(HAButton *sender)
 {
-  Serial.println("Received STOP command from HA Button");
+  LOG_PRINTLN("Received STOP command from HA Button");
   stop_movement(true);
 }
 
 void onCalibrateCommand(HAButton *sender)
 {
-  Serial.println("Received CALIBRATE command from HA");
+  LOG_PRINTLN("Received CALIBRATE command from HA");
   start_calibration();
 }
 
 // --- NEW: Callback for the HA Button ---
 void onMoveTo50Command(HAButton *sender)
 {
-  Serial.println("Received Move to 50% command from HA");
+  LOG_PRINTLN("Received Move to 50% command from HA");
   move_to_position(0.5f);
 }
 
@@ -593,7 +587,7 @@ void move_to_position(float new_target)
 {
   if (cal_state != CAL_INACTIVE)
   {
-    Serial.println("Cannot move to position: Calibration in progress.");
+    LOG_PRINTLN("Cannot move to position: Calibration in progress.");
     return;
   }
 
@@ -601,14 +595,14 @@ void move_to_position(float new_target)
   // This resets the state to IDLE, allowing a reversal of direction.
   if (current_operation != IDLE)
   {
-    Serial.println("Gate is currently moving, stopping first...");
+    LOG_PRINTLN("Gate is currently moving, stopping first...");
     stop_movement(false); // Programmatic stop, doesn't cancel user-intent
   }
 
   // Check if we are already there (with a small tolerance)
   if (abs(current_position - new_target) < 0.01)
   {
-    Serial.println("Already at target position.");
+    LOG_PRINTLN("Already at target position.");
     return;
   }
 
@@ -618,12 +612,12 @@ void move_to_position(float new_target)
   // Decide whether to open or close
   if (new_target > current_position)
   {
-    Serial.printf("Moving to position %.2f by OPENING.\n", target_position);
+    LOG_PRINTF("Moving to position %.2f by OPENING.\n", target_position);
     start_opening();
   }
   else
   {
-    Serial.printf("Moving to position %.2f by CLOSING.\n", target_position);
+    LOG_PRINTF("Moving to position %.2f by CLOSING.\n", target_position);
     start_closing();
   }
 }
@@ -637,7 +631,7 @@ void handle_indicator_light()
   {
     if (indicator_light_state)
     { // Only write if state needs to change
-      Serial.println("Indicator light OFF");
+      LOG_PRINTLN("Indicator light OFF");
       digitalWrite(RELAY_INDICATOR_LIGHT_PIN, LOW);
       indicator_light_state = false;
     }
@@ -650,11 +644,11 @@ void handle_indicator_light()
     last_blink_time = millis();
     if (!indicator_light_state)
     {
-      Serial.println("Indicator light ON");
+      LOG_PRINTLN("Indicator light ON");
     }
     else
     {
-      Serial.println("Indicator light OFF");
+      LOG_PRINTLN("Indicator light OFF");
     }
     indicator_light_state = !indicator_light_state;
     digitalWrite(RELAY_INDICATOR_LIGHT_PIN, indicator_light_state);
@@ -670,13 +664,13 @@ void handle_wifi_status()
     last_wifi_check = millis();
     if (WiFi.status() == WL_CONNECTED)
     {
-      // Serial.print("WiFi: Connected. IP Address: ");
-      // Serial.println(WiFi.localIP());
+      // LOG_PRINT("WiFi: Connected. IP Address: ");
+      // LOG_PRINTLN(WiFi.localIP());
       //  Future MQTT/Web server code can be triggered from here
     }
     else
     {
-      Serial.println("WiFi: Not connected. Trying to reconnect automatically...");
+      LOG_PRINTLN("WiFi: Not connected. Trying to reconnect automatically...");
       // ESP32's WiFi stack will handle reconnection attempts automatically
       // If it was previously configured.
     }
@@ -713,7 +707,7 @@ void handle_rf_signal()
     stop_movement(true);
     break;
   case RF_GATE_POS50_CODE:
-    Serial.println("RF command: Move to 50%");
+    LOG_PRINTLN("RF command: Move to 50%");
     move_to_position(0.5f);
     break;
   }
@@ -728,7 +722,7 @@ void handle_motor_relays()
     {
       digitalWrite(RELAY_MOTOR_ENABLE_PIN, HIGH);
       motor_relay_state = R_OFF;
-      Serial.println("Motor Enabled.");
+      LOG_PRINTLN("Motor Enabled.");
       movement_start_time = millis();
       movement_start_position = current_position;
     }
@@ -769,15 +763,15 @@ void start_opening()
     return;
   if (current_position >= 0.99f || digitalRead(LIMIT_OPEN_PIN) == LOW)
   {
-    Serial.println("Cannot open: Already fully open.");
+    LOG_PRINTLN("Cannot open: Already fully open.");
     return;
   }
   if (digitalRead(MOVEMENT_INHIBIT_PIN) == LOW)
   {
-    Serial.println("Cannot open: Movement inhibited.");
+    LOG_PRINTLN("Cannot open: Movement inhibited.");
     return;
   }
-  Serial.println("Command: OPEN");
+  LOG_PRINTLN("Command: OPEN");
   execute_open_sequence();
 }
 void start_closing()
@@ -786,15 +780,15 @@ void start_closing()
     return;
   if (current_position <= 0.01f || digitalRead(LIMIT_CLOSE_PIN) == LOW)
   {
-    Serial.println("Cannot close: Already fully closed.");
+    LOG_PRINTLN("Cannot close: Already fully closed.");
     return;
   }
   if (digitalRead(PHOTO_BARRIER_PIN) == LOW || digitalRead(MOVEMENT_INHIBIT_PIN) == LOW)
   {
-    Serial.println("Cannot close: Safety sensor active.");
+    LOG_PRINTLN("Cannot close: Safety sensor active.");
     return;
   }
-  Serial.println("Command: CLOSE");
+  LOG_PRINTLN("Command: CLOSE");
   execute_close_sequence();
 }
 void stop_movement(bool triggered_by_user)
@@ -803,15 +797,13 @@ void stop_movement(bool triggered_by_user)
     return;
   if (current_operation != IDLE || auto_resume_is_armed || resume_countdown_is_active)
   {
-    Serial.println("Command: STOP");
+    LOG_PRINTLN("Command: STOP");
   }
   digitalWrite(RELAY_MOTOR_ENABLE_PIN, LOW);
   digitalWrite(RELAY_MOTOR_DIRECTION_PIN, LOW);
   blink_interval = 0; // Stop blinking
   current_operation = IDLE;
   motor_relay_state = R_OFF;
-  stop_after_clear_countdown_active = false; // <-- NEW: Reset our countdown flag
-
 
   if (WiFi.status() == WL_CONNECTED)
   {
@@ -829,12 +821,12 @@ void stop_movement(bool triggered_by_user)
     target_position = -1.0; // <-- NEW: Cancel target on manual stop
     if (cal_state != CAL_INACTIVE)
     {
-      Serial.println("Calibration cancelled by user.");
+      LOG_PRINTLN("Calibration cancelled by user.");
       cal_state = CAL_INACTIVE;
     }
     if (auto_resume_is_armed || resume_countdown_is_active)
     {
-      Serial.println("Auto-resume cancelled by user.");
+      LOG_PRINTLN("Auto-resume cancelled by user.");
       auto_resume_is_armed = false;
       resume_countdown_is_active = false;
     }
@@ -854,7 +846,7 @@ void update_gate_position()
   if (current_operation != IDLE)
   {
     const char *stateStr = (current_operation == OPENING) ? "OPENING" : "CLOSING";
-    Serial.printf("Position: %.2f  State: %s\n", current_position, stateStr);
+    LOG_PRINTF("Position: %.2f  State: %s\n", current_position, stateStr);
   }
   // --- FIXED: Check if we have a specific target and have reached or passed it ---
   if (target_position >= 0.0)
@@ -863,7 +855,7 @@ void update_gate_position()
         (current_operation == CLOSING && current_position <= target_position))
     {
 
-      Serial.printf("Target position %.2f reached.\n", target_position);
+      LOG_PRINTF("Target position %.2f reached.\n", target_position);
       stop_movement(false);
       current_position = target_position; // Snap to the exact position for accuracy
       target_position = -1.0;             // Reset the target
@@ -871,40 +863,39 @@ void update_gate_position()
   }
   if (elapsed > gate_travel_time)
   {
-    Serial.println("Error: Gate movement timed out!");
+    LOG_PRINTLN("Error: Gate movement timed out!");
     stop_movement(false);
     target_position = -1.0; // <-- NEW: Clear target at hard limit
   }
 }
-/*
+
 void handle_safety_sensors()
-{ 
+{ /* ... unchanged ... */
   if (current_operation != IDLE && digitalRead(MOVEMENT_INHIBIT_PIN) == LOW)
   {
-    Serial.println("Safety: Movement inhibited!");
+    LOG_PRINTLN("Safety: Movement inhibited!");
     stop_movement(true);
     return;
   }
   if (current_operation == OPENING && digitalRead(LIMIT_OPEN_PIN) == LOW)
   {
-    Serial.println("Limit: OPEN reached");
+    LOG_PRINTLN("Limit: OPEN reached");
     stop_movement(false);
     current_position = 1.0f;
     target_position = -1.0; // <-- NEW: Clear target at hard limit
   }
   if (current_operation == CLOSING && digitalRead(LIMIT_CLOSE_PIN) == LOW)
   {
-    Serial.println("Limit: CLOSE reached");
+    LOG_PRINTLN("Limit: CLOSE reached");
     stop_movement(false);
     current_position = 0.0f;
     target_position = -1.0; // <-- NEW: Clear target at hard limit
   }
-
   bool is_path_blocked = (digitalRead(PHOTO_BARRIER_PIN) == LOW);
   static bool was_path_blocked = false;
   if (is_path_blocked && !was_path_blocked && current_operation == CLOSING)
   {
-    Serial.println("Photo Barrier: Obstacle detected. Reversing fully.");
+    LOG_PRINTLN("Photo Barrier: Obstacle detected. Reversing fully.");
     stop_movement(false);
     auto_resume_is_armed = true;
     resume_countdown_is_active = false;
@@ -917,7 +908,7 @@ void handle_safety_sensors()
     {
       if (!is_path_blocked)
       {
-        Serial.printf("Photo Barrier: Path is clear. Starting %lu sec auto-close timer.\n", OBSTACLE_CLEAR_RESUME_DELAY / 1000);
+        LOG_PRINTF("Photo Barrier: Path is clear. Starting %lu sec auto-close timer.\n", OBSTACLE_CLEAR_RESUME_DELAY / 1000);
         resume_countdown_is_active = true;
         path_cleared_time = millis();
         auto_resume_is_armed = false;
@@ -935,12 +926,12 @@ void handle_safety_sensors()
     {
       if (is_path_blocked)
       {
-        Serial.println("Photo Barrier: Path re-blocked at last moment. Resetting timer.");
+        LOG_PRINTLN("Photo Barrier: Path re-blocked at last moment. Resetting timer.");
         path_cleared_time = millis();
       }
       else
       {
-        Serial.println("Photo Barrier: Timer expired. Resuming close operation.");
+        LOG_PRINTLN("Photo Barrier: Timer expired. Resuming close operation.");
         resume_countdown_is_active = false;
         start_closing();
       }
@@ -948,139 +939,16 @@ void handle_safety_sensors()
   }
   was_path_blocked = is_path_blocked;
 }
-*/
-// --- REPLACE the existing handle_safety_sensors() function with this ---
-void handle_safety_sensors()
-{
-  /* ... (The first two 'if' blocks for MOVEMENT_INHIBIT and LIMIT_SWITCHES remain unchanged) ... */
-  if (current_operation != IDLE && digitalRead(MOVEMENT_INHIBIT_PIN) == LOW)
-  {
-    Serial.println("Safety: Movement inhibited!");
-    stop_movement(true);
-    return;
-  }
-  if (current_operation == OPENING && digitalRead(LIMIT_OPEN_PIN) == LOW)
-  {
-    Serial.println("Limit: OPEN reached");
-    stop_movement(false);
-    current_position = 1.0f;
-    target_position = -1.0;
-  }
-  if (current_operation == CLOSING && digitalRead(LIMIT_CLOSE_PIN) == LOW)
-  {
-    Serial.println("Limit: CLOSE reached");
-    stop_movement(false);
-    current_position = 0.0f;
-    target_position = -1.0;
-  }
-
-  // --- MODIFIED Photo Barrier Logic ---
-  bool is_path_blocked = (digitalRead(PHOTO_BARRIER_PIN) == LOW);
-  static bool was_path_blocked = false;
-
-  // 1. Obstacle is detected while closing
-  if (is_path_blocked && !was_path_blocked && current_operation == CLOSING)
-  {
-    Serial.println("Photo Barrier: Obstacle detected.");
-    stop_movement(false);
-    auto_resume_is_armed = true;
-    resume_countdown_is_active = false;
-    target_position = -1.0;
-
-    if (smart_photobarrier_mode) {
-        Serial.println("Smart Mode: Reversing until path is clear...");
-        current_operation = REVERSING_FROM_OBSTACLE; // Use the new state
-        if (WiFi.status() == WL_CONNECTED) {
-            cover.setState(HACover::StateOpening); // Appear as "opening" in HA
-        }
-        execute_open_sequence();
-    } else {
-        Serial.println("Safe Mode: Reversing fully.");
-        execute_open_sequence(); // Original behavior
-    }
-  }
-
-  // 2. NEW LOGIC: Handle the smart reversal state
-  if (current_operation == REVERSING_FROM_OBSTACLE)
-  {
-      // If the path becomes clear, start a 2-second timer to stop.
-      if (!is_path_blocked && !stop_after_clear_countdown_active) {
-          Serial.printf("Path is clear. Stopping in %lu ms.\n", OBSTACLE_REVERSE_CLEAR_DELAY);
-          stop_after_clear_countdown_active = true;
-          path_cleared_while_reversing_time = millis();
-      }
-
-      // If the timer is running and has expired, stop the gate.
-      if (stop_after_clear_countdown_active && (millis() - path_cleared_while_reversing_time >= OBSTACLE_REVERSE_CLEAR_DELAY)) {
-          Serial.println("Reversal complete.");
-          stop_movement(false); // This will set state to IDLE
-      }
-  }
-
-  // 3. MODIFIED Auto-resume logic (works for both modes now)
-  if (auto_resume_is_armed)
-  {
-    // This now triggers when the gate is idle, regardless of position
-    if (current_operation == IDLE)
-    {
-      if (!is_path_blocked)
-      {
-        Serial.printf("Path is clear. Starting %lu sec auto-close timer.\n", OBSTACLE_CLEAR_RESUME_DELAY / 1000);
-        resume_countdown_is_active = true;
-        path_cleared_time = millis();
-        auto_resume_is_armed = false; // Disarm here
-      }
-    }
-  }
-
-  // 4. Countdown logic (remains mostly the same)
-  if (resume_countdown_is_active)
-  {
-    if (current_operation != IDLE) {
-        resume_countdown_is_active = false;
-        return;
-    }
-    if (millis() - path_cleared_time >= OBSTACLE_CLEAR_RESUME_DELAY)
-    {
-      if (is_path_blocked) {
-        Serial.println("Photo Barrier: Path re-blocked. Resetting timer.");
-        path_cleared_time = millis();
-      } else {
-        Serial.println("Photo Barrier: Timer expired. Resuming close operation.");
-        resume_countdown_is_active = false;
-        start_closing();
-      }
-    }
-  }
-  was_path_blocked = is_path_blocked;
-}
-
-
-
 void start_calibration()
 { /* ... unchanged ... */
   if (current_operation != IDLE || cal_state != CAL_INACTIVE)
     return;
-  Serial.println("--- Starting Gate Calibration ---");
+  LOG_PRINTLN("--- Starting Gate Calibration ---");
   cal_state = CAL_CLOSING_TO_START;
   blink_interval = CALIBRATION_BLINK_INTERVAL; // Set fast blink for calibration
 }
 void handle_calibration()
-{ 
-    // 2025-09 01
-    // --- IMPROVEMENT: Add safety checks inside calibration loop ---
-  if (digitalRead(MOVEMENT_INHIBIT_PIN) == LOW) {
-      Serial.println("Calibration cancelled: Movement Inhibited.");
-      stop_movement(true); // User-triggered stop to cancel calibration
-      return;
-  }
-  // During the initial close, an obstacle is a critical failure.
-  if (cal_state == CAL_CLOSING_TO_START && digitalRead(PHOTO_BARRIER_PIN) == LOW) {
-      Serial.println("Calibration cancelled: Obstacle detected during initial close.");
-      stop_movement(true);
-      return;
-  }
-
+{ /* ... unchanged ... */
   switch (cal_state)
   {
   case CAL_CLOSING_TO_START:
@@ -1088,7 +956,7 @@ void handle_calibration()
     {
       if (digitalRead(LIMIT_CLOSE_PIN) == LOW)
       {
-        Serial.println("Step 1 Complete: Already at close limit.");
+        LOG_PRINTLN("Step 1 Complete: Already at close limit.");
         stop_movement(false);
         current_position = 0.0f;
         cal_state = CAL_OPENING_FOR_TIMING;
@@ -1096,13 +964,13 @@ void handle_calibration()
       }
       else
       {
-        Serial.println("Step 1: Closing gate to find zero position...");
+        LOG_PRINTLN("Step 1: Closing gate to find zero position...");
         execute_close_sequence();
       }
     }
     if (current_operation == CLOSING && digitalRead(LIMIT_CLOSE_PIN) == LOW)
     {
-      Serial.println("Step 1 Complete: Close limit found.");
+      LOG_PRINTLN("Step 1 Complete: Close limit found.");
       stop_movement(false);
       current_position = 0.0f;
       cal_state = CAL_OPENING_FOR_TIMING;
@@ -1111,12 +979,12 @@ void handle_calibration()
   case CAL_OPENING_FOR_TIMING:
     if (current_operation == IDLE)
     {
-      Serial.println("Step 2: Opening gate to measure travel time...");
+      LOG_PRINTLN("Step 2: Opening gate to measure travel time...");
       execute_open_sequence();
     }
     if (current_operation == OPENING && digitalRead(LIMIT_OPEN_PIN) == LOW)
     {
-      Serial.println("Step 2 Complete: Open limit found.");
+      LOG_PRINTLN("Step 2 Complete: Open limit found.");
       stop_movement(false);
       gate_travel_time = millis() - movement_start_time;
       current_position = 1.0f;
@@ -1126,9 +994,9 @@ void handle_calibration()
   case CAL_DONE:
     if (current_operation == IDLE)
     {
-      Serial.println("--- Calibration Complete ---");
-      Serial.printf("New gate travel time: %lu ms\n", gate_travel_time);
-      Serial.println("Position has been set to OPEN (1.0).");
+      LOG_PRINTLN("--- Calibration Complete ---");
+      LOG_PRINTF("New gate travel time: %lu ms\n", gate_travel_time);
+      LOG_PRINTLN("Position has been set to OPEN (1.0).");
       save_params();
       cal_state = CAL_INACTIVE;
       publish_all_states();
