@@ -13,9 +13,23 @@
 
 #include "SerialMirror.hpp" // Include SerialMirror class and LOG_PRINT macros
 
+// --- Build-time Configuration ---
+// Set the motor control mode.
+// 1: Direction relay + Enable relay (Original mode)
+// 2: Open relay + Close relay (New mode)
+#define MOTOR_CONTROL_MODE 2 // <--- SET THIS TO 1 or 2 AT BUILD TIME
+
 // ——— Pin definitions ———
+#if MOTOR_CONTROL_MODE == 1
+// Mode 1: One relay for direction, one for power
 const int RELAY_MOTOR_DIRECTION_PIN = 1;
 const int RELAY_MOTOR_ENABLE_PIN = 3;
+#elif MOTOR_CONTROL_MODE == 2
+// Mode 2: One relay for opening, one for closing
+const int RELAY_MOTOR_OPEN_PIN = 1;
+const int RELAY_MOTOR_CLOSE_PIN = 3;
+#endif
+
 const int RELAY_INDICATOR_LIGHT_PIN = 4;
 const int MANUAL_OPEN_BUTTON_PIN = 5;
 const int MANUAL_CLOSE_BUTTON_PIN = 6;
@@ -174,17 +188,37 @@ enum CalibrationState
   CAL_OPENING_FOR_TIMING,
   CAL_DONE
 };
+
+#if MOTOR_CONTROL_MODE == 1
+// This state is only for Mode 1 (Direction + Enable relays)
 enum MotorRelayState
 {
   R_OFF,
   R_WAIT_ENABLE
 };
+#elif MOTOR_CONTROL_MODE == 2
+// State machine for Mode 2 to ensure a delay when changing direction
+enum MotorChangeState
+{
+  M_IDLE,
+  M_WAIT_FOR_ENGAGE
+};
+#endif
 
 // ——— Global state variables ———
 CoverOperation current_operation = IDLE;
 CalibrationState cal_state = CAL_INACTIVE;
+
+#if MOTOR_CONTROL_MODE == 1
+// These variables are only used in Mode 1
 MotorRelayState motor_relay_state = R_OFF;
 unsigned long motor_relay_timer = 0;
+#elif MOTOR_CONTROL_MODE == 2
+// These variables are only used in Mode 2
+MotorChangeState motor_change_state = M_IDLE;
+unsigned long motor_change_timer = 0;
+CoverOperation next_operation = IDLE; // To store which direction to engage after delay
+#endif
 
 float current_position = 0.0;
 unsigned long movement_start_time;
@@ -255,16 +289,6 @@ void publish_all_states()
   {
     gateState.setValue("stopped");
   }
-
-  // limitOpen.setState(digitalRead(LIMIT_OPEN_PIN) == LOW);
-  // limitClose.setState(digitalRead(LIMIT_CLOSE_PIN) == LOW);
-  // photoBarrier.setState(digitalRead(PHOTO_BARRIER_PIN) == LOW);
-  // movementInhibit.setState(digitalRead(MOVEMENT_INHIBIT_PIN) == LOW);
-
-  // char code_str[20];
-  // sprintf(code_str, "%lu", last_rf_code_received);
-  // rfCodeSensor.setValue(code_str);
-
   gateIP.setValue(WiFi.localIP().toString().c_str());
 }
 
@@ -367,11 +391,20 @@ void setup()
   rfCodeSensor.setName("Last RF Code");
   rfCodeSensor.setIcon("mdi:remote-control");
 
+#if MOTOR_CONTROL_MODE == 1
+  LOG_PRINTLN("Configured for Motor Control Mode 1 (Direction + Enable Relays).");
   pinMode(RELAY_MOTOR_DIRECTION_PIN, OUTPUT);
   pinMode(RELAY_MOTOR_ENABLE_PIN, OUTPUT);
-  pinMode(RELAY_INDICATOR_LIGHT_PIN, OUTPUT);
   digitalWrite(RELAY_MOTOR_ENABLE_PIN, LOW);
   digitalWrite(RELAY_MOTOR_DIRECTION_PIN, LOW);
+#elif MOTOR_CONTROL_MODE == 2
+  LOG_PRINTLN("Configured for Motor Control Mode 2 (Open + Close Relays).");
+  pinMode(RELAY_MOTOR_OPEN_PIN, OUTPUT);
+  pinMode(RELAY_MOTOR_CLOSE_PIN, OUTPUT);
+  digitalWrite(RELAY_MOTOR_OPEN_PIN, LOW);
+  digitalWrite(RELAY_MOTOR_CLOSE_PIN, LOW);
+#endif
+  pinMode(RELAY_INDICATOR_LIGHT_PIN, OUTPUT);
   digitalWrite(RELAY_INDICATOR_LIGHT_PIN, LOW);
 
   pinMode(MOVEMENT_INHIBIT_PIN, INPUT_PULLUP);
@@ -409,15 +442,15 @@ void setup()
   // This is the key to reliably saving parameters, as it runs *before* the device restarts.
   wm.setSaveConfigCallback([]()
                            {
-        LOG_PRINTLN("SaveConfigCallback triggered. Saving custom parameters...");
-        // Retrieve values from the parameter objects and store them in our global variables
-        strncpy(mqtt_server, custom_mqtt_server.getValue(), sizeof(mqtt_server));
-        strncpy(mqtt_port_str, custom_mqtt_port.getValue(), sizeof(mqtt_port_str));
-        strncpy(mqtt_user, custom_mqtt_user.getValue(), sizeof(mqtt_user));
-        strncpy(mqtt_password, custom_mqtt_password.getValue(), sizeof(mqtt_password));
+    LOG_PRINTLN("SaveConfigCallback triggered. Saving custom parameters...");
+    // Retrieve values from the parameter objects and store them in our global variables
+    strncpy(mqtt_server, custom_mqtt_server.getValue(), sizeof(mqtt_server));
+    strncpy(mqtt_port_str, custom_mqtt_port.getValue(), sizeof(mqtt_port_str));
+    strncpy(mqtt_user, custom_mqtt_user.getValue(), sizeof(mqtt_user));
+    strncpy(mqtt_password, custom_mqtt_password.getValue(), sizeof(mqtt_password));
 
-        // Now, explicitly save these global variables to LittleFS
-        save_params(); });
+    // Now, explicitly save these global variables to LittleFS
+    save_params(); });
 
   buttonOpen.setPressedHandler(open_button_pressed);
   buttonClose.setPressedHandler(close_button_pressed);
@@ -474,10 +507,6 @@ void setup()
   LOG_PRINTLN("Hold STOP for 2s to calibrate.");
   LOG_PRINTLN("Hold OPEN for 2s for WiFi setup.");
 
-  // 1) Configure MQTT → broker parameters & credentials
-  //    This does *not* block; first connect attempt happens in mqtt.loop().
-
-  // Serial print mqtt parameters
   LOG_PRINTLN("MQTT Configuration:");
   LOG_PRINTF(" - Server: %s\n", mqtt_server);
   LOG_PRINTF(" - Port: %s\n", mqtt_port_str);
@@ -498,11 +527,7 @@ void loop()
   // --- MQTT layer ---
   if (WiFi.status() == WL_CONNECTED)
   {
-    // mqtt.loop() will:
-    //  • keep the keep-alive ping alive
-    //  • notice if the socket dropped
-    //  • automatically reconnect every 10 s (ReconnectInterval) if needed
-    mqtt.loop(); // ← critical for auto-reconnect :contentReference[oaicite:0]{index=0}
+    mqtt.loop(); // ← critical for auto-reconnect
 
     if (telnetServer.hasClient())
     {
@@ -631,7 +656,6 @@ void handle_indicator_light()
   {
     if (indicator_light_state)
     { // Only write if state needs to change
-      LOG_PRINTLN("Indicator light OFF");
       digitalWrite(RELAY_INDICATOR_LIGHT_PIN, LOW);
       indicator_light_state = false;
     }
@@ -642,14 +666,6 @@ void handle_indicator_light()
   if (millis() - last_blink_time > blink_interval)
   {
     last_blink_time = millis();
-    if (!indicator_light_state)
-    {
-      LOG_PRINTLN("Indicator light ON");
-    }
-    else
-    {
-      LOG_PRINTLN("Indicator light OFF");
-    }
     indicator_light_state = !indicator_light_state;
     digitalWrite(RELAY_INDICATOR_LIGHT_PIN, indicator_light_state);
   }
@@ -662,26 +678,15 @@ void handle_wifi_status()
   if (millis() - last_wifi_check > WIFI_RETRY_INTERVAL)
   {
     last_wifi_check = millis();
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      // LOG_PRINT("WiFi: Connected. IP Address: ");
-      // LOG_PRINTLN(WiFi.localIP());
-      //  Future MQTT/Web server code can be triggered from here
-    }
-    else
+    if (WiFi.status() != WL_CONNECTED)
     {
       LOG_PRINTLN("WiFi: Not connected. Trying to reconnect automatically...");
-      // ESP32's WiFi stack will handle reconnection attempts automatically
-      // If it was previously configured.
     }
   }
 }
 
-// ALL OTHER FUNCTIONS FROM THE PREVIOUS "BASE" CODE REMAIN UNCHANGED
-// (Pasted below for completeness)
-
 void handle_rf_signal()
-{ /* ... unchanged ... */
+{
   if (!mySwitch.available())
     return;
   unsigned long code = mySwitch.getReceivedValue();
@@ -712,8 +717,11 @@ void handle_rf_signal()
     break;
   }
 }
+
 void handle_motor_relays()
-{ /* ... unchanged ... */
+{
+#if MOTOR_CONTROL_MODE == 1
+  // This logic is for Mode 1 only (Direction + Enable relays)
   if (motor_relay_state == R_OFF)
     return;
   if (millis() - motor_relay_timer >= MOTOR_DIRECTION_DELAY)
@@ -727,35 +735,103 @@ void handle_motor_relays()
       movement_start_position = current_position;
     }
   }
+#elif MOTOR_CONTROL_MODE == 2
+  // This logic is for Mode 2 only (Open + Close relays with delay)
+  if (motor_change_state == M_WAIT_FOR_ENGAGE)
+  {
+    if (millis() - motor_change_timer >= MOTOR_DIRECTION_DELAY)
+    {
+      if (next_operation == OPENING)
+      {
+        LOG_PRINTLN("Motor Opening (Mode 2) after delay.");
+        digitalWrite(RELAY_MOTOR_OPEN_PIN, HIGH);
+      }
+      else if (next_operation == CLOSING)
+      {
+        LOG_PRINTLN("Motor Closing (Mode 2) after delay.");
+        digitalWrite(RELAY_MOTOR_CLOSE_PIN, HIGH);
+      }
+      motor_change_state = M_IDLE;
+      next_operation = IDLE;
+      // Start the movement timer now that the motor is actually engaged
+      movement_start_time = millis();
+      movement_start_position = current_position;
+    }
+  }
+#endif
 }
+
 void execute_open_sequence()
 {
+#if MOTOR_CONTROL_MODE == 1
   if (current_operation != IDLE || motor_relay_state != R_OFF)
     return;
+#else // Mode 2
+  if (current_operation != IDLE)
+    return;
+#endif
+
   current_operation = OPENING;
   if (WiFi.status() == WL_CONNECTED)
   {
     cover.setState(HACover::StateOpening);
   }
   blink_interval = BLINK_INTERVAL_OPENING; // Set slow blink
+
+#if MOTOR_CONTROL_MODE == 1
   digitalWrite(RELAY_MOTOR_DIRECTION_PIN, LOW);
   motor_relay_timer = millis();
   motor_relay_state = R_WAIT_ENABLE;
+#elif MOTOR_CONTROL_MODE == 2
+  // In Mode 2, we turn off both relays first, then wait for a delay
+  // handled by handle_motor_relays() before turning the correct one on.
+  // This is a safety feature to prevent shorting the motor driver.
+  digitalWrite(RELAY_MOTOR_OPEN_PIN, LOW);
+  digitalWrite(RELAY_MOTOR_CLOSE_PIN, LOW);
+  LOG_PRINTLN("Motor Opening (Mode 2), waiting for relay delay.");
+  
+  motor_change_state = M_WAIT_FOR_ENGAGE;
+  motor_change_timer = millis();
+  next_operation = OPENING;
+  // movement_start_time is now set inside handle_motor_relays()
+#endif
 }
+
 void execute_close_sequence()
-{ /* ... unchanged ... */
+{
+#if MOTOR_CONTROL_MODE == 1
   if (current_operation != IDLE || motor_relay_state != R_OFF)
     return;
+#else // Mode 2
+  if (current_operation != IDLE)
+    return;
+#endif
+
   current_operation = CLOSING;
   if (WiFi.status() == WL_CONNECTED)
   {
     cover.setState(HACover::StateClosing);
   }
   blink_interval = BLINK_INTERVAL_CLOSING; // Set fast blink
+
+#if MOTOR_CONTROL_MODE == 1
   digitalWrite(RELAY_MOTOR_DIRECTION_PIN, HIGH);
   motor_relay_timer = millis();
   motor_relay_state = R_WAIT_ENABLE;
+#elif MOTOR_CONTROL_MODE == 2
+  // In Mode 2, we turn off both relays first, then wait for a delay
+  // handled by handle_motor_relays() before turning the correct one on.
+  digitalWrite(RELAY_MOTOR_OPEN_PIN, LOW);
+  digitalWrite(RELAY_MOTOR_CLOSE_PIN, LOW);
+  LOG_PRINTLN("Motor Closing (Mode 2), waiting for relay delay.");
+
+  motor_change_state = M_WAIT_FOR_ENGAGE;
+  motor_change_timer = millis();
+  next_operation = CLOSING;
+  // movement_start_time is now set inside handle_motor_relays()
+#endif
 }
+
 void start_opening()
 {
 
@@ -774,8 +850,9 @@ void start_opening()
   LOG_PRINTLN("Command: OPEN");
   execute_open_sequence();
 }
+
 void start_closing()
-{ /* ... unchanged ... */
+{
   if (current_operation != IDLE || cal_state != CAL_INACTIVE)
     return;
   if (current_position <= 0.01f || digitalRead(LIMIT_CLOSE_PIN) == LOW)
@@ -791,19 +868,31 @@ void start_closing()
   LOG_PRINTLN("Command: CLOSE");
   execute_close_sequence();
 }
+
 void stop_movement(bool triggered_by_user)
-{ /* ... unchanged ... */
+{
   if (current_operation == IDLE && cal_state == CAL_INACTIVE && !auto_resume_is_armed && !resume_countdown_is_active)
     return;
   if (current_operation != IDLE || auto_resume_is_armed || resume_countdown_is_active)
   {
     LOG_PRINTLN("Command: STOP");
   }
+
+#if MOTOR_CONTROL_MODE == 1
   digitalWrite(RELAY_MOTOR_ENABLE_PIN, LOW);
   digitalWrite(RELAY_MOTOR_DIRECTION_PIN, LOW);
+  motor_relay_state = R_OFF;
+#elif MOTOR_CONTROL_MODE == 2
+  LOG_PRINTLN("Motor Stopped (Mode 2).");
+  digitalWrite(RELAY_MOTOR_OPEN_PIN, LOW);
+  digitalWrite(RELAY_MOTOR_CLOSE_PIN, LOW);
+  // Also cancel any pending direction change
+  motor_change_state = M_IDLE;
+  next_operation = IDLE;
+#endif
+
   blink_interval = 0; // Stop blinking
   current_operation = IDLE;
-  motor_relay_state = R_OFF;
 
   if (WiFi.status() == WL_CONNECTED)
   {
@@ -832,10 +921,19 @@ void stop_movement(bool triggered_by_user)
     }
   }
 }
+
 void update_gate_position()
-{ /* ... unchanged ... */
+{
+#if MOTOR_CONTROL_MODE == 1
+  // In mode 1, don't update position until the motor enable relay is active
   if (motor_relay_state != R_OFF)
     return;
+#elif MOTOR_CONTROL_MODE == 2
+  // In mode 2, don't update position until the motor is actually engaged after the delay
+  if (motor_change_state != M_IDLE)
+    return;
+#endif
+
   unsigned long elapsed = millis() - movement_start_time;
   float ratio = gate_travel_time > 0 ? float(elapsed) / float(gate_travel_time) : 0.0f;
   if (current_operation == OPENING)
@@ -858,7 +956,7 @@ void update_gate_position()
       LOG_PRINTF("Target position %.2f reached.\n", target_position);
       stop_movement(false);
       current_position = target_position; // Snap to the exact position for accuracy
-      target_position = -1.0;             // Reset the target
+      target_position = -1.0;              // Reset the target
     }
   }
   if (elapsed > gate_travel_time)
@@ -870,7 +968,7 @@ void update_gate_position()
 }
 
 void handle_safety_sensors()
-{ /* ... unchanged ... */
+{
   if (current_operation != IDLE && digitalRead(MOVEMENT_INHIBIT_PIN) == LOW)
   {
     LOG_PRINTLN("Safety: Movement inhibited!");
@@ -940,7 +1038,7 @@ void handle_safety_sensors()
   was_path_blocked = is_path_blocked;
 }
 void start_calibration()
-{ /* ... unchanged ... */
+{
   if (current_operation != IDLE || cal_state != CAL_INACTIVE)
     return;
   LOG_PRINTLN("--- Starting Gate Calibration ---");
@@ -948,7 +1046,7 @@ void start_calibration()
   blink_interval = CALIBRATION_BLINK_INTERVAL; // Set fast blink for calibration
 }
 void handle_calibration()
-{ /* ... unchanged ... */
+{
   switch (cal_state)
   {
   case CAL_CLOSING_TO_START:
@@ -1006,3 +1104,4 @@ void handle_calibration()
     break;
   }
 }
+
