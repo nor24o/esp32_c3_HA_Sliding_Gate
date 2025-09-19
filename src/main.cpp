@@ -23,20 +23,25 @@
 #if MOTOR_CONTROL_MODE == 1
 // Mode 1: One relay for direction, one for power
 const int RELAY_MOTOR_DIRECTION_PIN = 1;
-const int RELAY_MOTOR_ENABLE_PIN = 3;
+const int RELAY_MOTOR_ENABLE_PIN = 4;
 #elif MOTOR_CONTROL_MODE == 2
 // Mode 2: One relay for opening, one for closing
 const int RELAY_MOTOR_OPEN_PIN = 1;
-const int RELAY_MOTOR_CLOSE_PIN = 3;
+const int RELAY_MOTOR_CLOSE_PIN = 4;
 #endif
 
-const int RELAY_INDICATOR_LIGHT_PIN = 4;
-const int MANUAL_OPEN_BUTTON_PIN = 5;
-const int MANUAL_CLOSE_BUTTON_PIN = 6;
-const int MANUAL_STOP_BUTTON_PIN = 7;
+const int RELAY_INDICATOR_LIGHT_PIN = 3;
+// --- NEW: Simplified Button Configuration ---
+// The main button now handles Open/Close/Stop toggle functionality.
+const int MANUAL_MAIN_BUTTON_PIN = 5; // Was MANUAL_OPEN_BUTTON_PIN
+const int MANUAL_WIFI_BUTTON_PIN = 6; // <-- NEW: Dedicated button for WiFi config
+// A separate button is kept for the calibration long-press. Its short-press is disabled.
+const int MANUAL_MAINTENANCE_BUTTON_PIN = 7; // Was MANUAL_STOP_BUTTON_PIN
+// Pin 6 is now dedicated to WiFi setup.
+
 const int MOVEMENT_INHIBIT_PIN = 8;
 const int LIMIT_OPEN_PIN = 10;
-const int LIMIT_CLOSE_PIN = 17;
+const int LIMIT_CLOSE_PIN = 20;
 const int PHOTO_BARRIER_PIN = 2;
 const int RF_RECEIVER_PIN = 21;
 
@@ -44,8 +49,12 @@ const int RF_RECEIVER_PIN = 21;
 unsigned long MOTOR_DIRECTION_DELAY = 700;
 unsigned long OBSTACLE_CLEAR_RESUME_DELAY = 8000;
 unsigned long CALIBRATION_LONG_PRESS_TIME = 8000;
-unsigned long WIFI_CONFIG_LONG_PRESS_TIME = 10000;
+unsigned long WIFI_CONFIG_LONG_PRESS_TIME = 5000; // Changed from 10000 to 5000 (5 seconds)
 unsigned long WIFI_RETRY_INTERVAL = 30000;
+const unsigned long REVERSE_LONG_PRESS_TIME = 1000; // 1 second for long press to reverse
+const unsigned long RF_LEARN_TIMEOUT = 30000; // 30 seconds timeout for learning mode
+const unsigned long RF_LEARN_SAVE_LONG_PRESS_TIME = 1500; // 1.5s to save and exit learning mode
+
 
 // Persistent parameters
 // These are the default values. They will be overwritten by values from LittleFS if available.
@@ -55,11 +64,13 @@ char mqtt_port_str[6] = "1883";
 char mqtt_user[32] = "admin";
 char mqtt_password[64] = "admin";
 
-// Replace these with the codes from your 433MHz remote
-#define RF_GATE_OPEN_CODE 1234567
-#define RF_GATE_CLOSE_CODE 7654321
-#define RF_GATE_STOP_CODE 1111111
-#define RF_GATE_POS50_CODE 2222222
+// --- RF codes are now variables, not constants, to allow for learning ---
+// These are the default codes, which will be overwritten by values from LittleFS if available.
+unsigned long rf_gate_open_code = 1234567;
+unsigned long rf_gate_close_code = 7654321;
+unsigned long rf_gate_stop_code = 1111111;
+unsigned long rf_gate_pos50_code = 2222222;
+
 
 // --- WiFiManager Custom Parameters ---
 WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, sizeof(mqtt_server));
@@ -75,9 +86,11 @@ bool indicator_light_state = false;
 // --- LittleFS storage helpers ---
 #define PARAMS_FILE "/gate_params_data.txt"
 
-#define BLINK_INTERVAL_OPENING 1000    // 1 second
-#define BLINK_INTERVAL_CLOSING 500     // 0.5 second
+#define BLINK_INTERVAL_OPENING 1000      // 1 second
+#define BLINK_INTERVAL_CLOSING 500       // 0.5 second
 #define CALIBRATION_BLINK_INTERVAL 100 // 0.2 second for calibration
+#define RF_LEARN_BLINK_INTERVAL 250 // Fast blink for RF learning mode
+
 
 void save_params()
 {
@@ -89,6 +102,12 @@ void save_params()
   doc["mqtt_port"] = mqtt_port_str;
   doc["mqtt_user"] = mqtt_user;
   doc["mqtt_password"] = mqtt_password;
+  
+  // --- NEW: Save learned RF codes ---
+  doc["rf_gate_open_code"] = rf_gate_open_code;
+  doc["rf_gate_close_code"] = rf_gate_close_code;
+  doc["rf_gate_stop_code"] = rf_gate_stop_code;
+  doc["rf_gate_pos50_code"] = rf_gate_pos50_code;
 
   File configFile = LittleFS.open(PARAMS_FILE, "w");
   if (!configFile)
@@ -131,12 +150,23 @@ void load_params()
       strncpy(mqtt_user, doc["mqtt_user"] | mqtt_user, sizeof(mqtt_user));
       strncpy(mqtt_password, doc["mqtt_password"] | mqtt_password, sizeof(mqtt_password));
 
+      // --- NEW: Load learned RF codes, with fallback to defaults ---
+      rf_gate_open_code = doc["rf_gate_open_code"] | rf_gate_open_code;
+      rf_gate_close_code = doc["rf_gate_close_code"] | rf_gate_close_code;
+      rf_gate_stop_code = doc["rf_gate_stop_code"] | rf_gate_stop_code;
+      rf_gate_pos50_code = doc["rf_gate_pos50_code"] | rf_gate_pos50_code;
+
       LOG_PRINTLN("Configuration loaded:");
       LOG_PRINTF(" - Travel Time: %lu\n", gate_travel_time);
       LOG_PRINTF(" - MQTT Server: %s\n", mqtt_server);
       LOG_PRINTF(" - MQTT Port: %s\n", mqtt_port_str);
       LOG_PRINTF(" - MQTT User: %s\n", mqtt_user);
-      // Do not print password for security
+      LOG_PRINTLN("Loaded RF Codes:");
+      LOG_PRINTF(" - Open: %lu\n", rf_gate_open_code);
+      LOG_PRINTF(" - Close: %lu\n", rf_gate_close_code);
+      LOG_PRINTF(" - Stop: %lu\n", rf_gate_stop_code);
+      LOG_PRINTF(" - Pos50: %lu\n", rf_gate_pos50_code);
+
 
       configFile.close();
     }
@@ -151,9 +181,9 @@ void load_params()
 
 // ——— Library Objects ———
 RCSwitch mySwitch;
-Button2 buttonOpen;
-Button2 buttonClose;
-Button2 buttonStop;
+Button2 mainButton;        // Replaces separate open/close/stop buttons
+Button2 maintenanceButton; // Used for calibration long-press
+Button2 wifiButton;        // <-- NEW: Button for WiFi config
 WiFiManager wm;
 WiFiServer telnetServer(23);
 
@@ -205,9 +235,24 @@ enum MotorChangeState
 };
 #endif
 
+// --- NEW: Enum and state for RF Learning Mode ---
+enum RFLearningState {
+    RF_LEARN_INACTIVE,
+    RF_LEARN_WAIT_OPEN,
+    RF_LEARN_WAIT_CLOSE,
+    RF_LEARN_WAIT_STOP,
+    RF_LEARN_WAIT_POS50
+};
+
+
 // ——— Global state variables ———
 CoverOperation current_operation = IDLE;
 CalibrationState cal_state = CAL_INACTIVE;
+CoverOperation last_operation_before_stop = IDLE; // Remembers last direction for pause/resume
+
+RFLearningState rf_learn_state = RF_LEARN_INACTIVE;
+unsigned long rf_learn_start_time = 0;
+
 
 #if MOTOR_CONTROL_MODE == 1
 // These variables are only used in Mode 1
@@ -249,10 +294,17 @@ void handle_wifi_status(); // Changed from handle_wifi
 void onCalibrateCommand(HAButton *sender);
 void handle_indicator_light();
 void onMoveTo50Command(HAButton *sender); // <-- NEW
-void move_to_position(float new_target);  // <-- NEW
+void move_to_position(float new_target);   // <-- NEW
 void onOpenCommand(HAButton *sender);
 void onCloseCommand(HAButton *sender);
 void onStopCommand(HAButton *sender);
+void main_button_short_press(Button2 &btn); // For pause/resume
+void main_button_long_press(Button2 &btn);  // For reverse
+void wifi_button_short_press(Button2 &btn); // <-- NEW: For RF Learning
+void handle_rf_learning();                  // <-- NEW: Handler for the learning process
+void maintenance_button_short_press(Button2 &btn); // For skipping RF learn steps
+void maintenance_button_long_press(Button2 &btn); // For saving RF learn / calibration
+
 
 void publish_all_states()
 {
@@ -268,6 +320,10 @@ void publish_all_states()
   if (cal_state != CAL_INACTIVE)
   {
     gateState.setValue("calibrating");
+  }
+  else if (rf_learn_state != RF_LEARN_INACTIVE) // <-- NEW
+  {
+      gateState.setValue("rf_learning");
   }
   else if (current_operation == OPENING)
   {
@@ -293,19 +349,116 @@ void publish_all_states()
 }
 
 // ——— Button Callback Functions ———
-void open_button_pressed(Button2 &btn)
+
+// NEW: Handlers for main button with advanced pause, resume, and reverse logic.
+void main_button_short_press(Button2 &btn)
 {
-  if (cal_state == CAL_INACTIVE)
-    start_opening();
+    if (cal_state != CAL_INACTIVE || rf_learn_state != RF_LEARN_INACTIVE) return;
+
+    if (current_operation != IDLE)
+    {
+        // If gate is moving, a short press will PAUSE it.
+        LOG_PRINTLN("Main button (short press): Pausing movement.");
+        stop_movement(true);
+    }
+    else // Gate is stopped (IDLE)
+    {
+        if (last_operation_before_stop != IDLE)
+        {
+            // If gate was paused, RESUME in the same direction.
+            LOG_PRINTLN("Main button (short press): Resuming movement.");
+            if (last_operation_before_stop == OPENING) {
+                start_opening();
+            } else { // last_operation_before_stop == CLOSING
+                start_closing();
+            }
+        }
+        else // Gate is stopped at a limit or was stopped programmatically.
+        {
+            // Standard toggle behavior.
+            if (current_position >= 0.99f) {
+                LOG_PRINTLN("Main button (short press): Gate is open, starting to close.");
+                start_closing();
+            } else {
+                LOG_PRINTLN("Main button (short press): Gate is not open, starting to open.");
+                start_opening();
+            }
+        }
+    }
 }
-void close_button_pressed(Button2 &btn)
+
+void main_button_long_press(Button2 &btn)
 {
-  if (cal_state == CAL_INACTIVE)
-    start_closing();
+    if (cal_state != CAL_INACTIVE || rf_learn_state != RF_LEARN_INACTIVE) return;
+
+    LOG_PRINTLN("Main button (long press): Reversing direction.");
+
+    // Determine the last or current direction of movement.
+    CoverOperation effective_direction = current_operation;
+    if (effective_direction == IDLE) {
+        effective_direction = last_operation_before_stop;
+    }
+    
+    // By calling the execute sequence directly, we avoid the abrupt stop_movement()
+    // and create a smoother transition from one direction to the other.
+    if (effective_direction == OPENING || (effective_direction == IDLE && current_position >= 0.99f)) {
+        // If it was opening, or it is fully open, the reverse action is to CLOSE.
+        execute_close_sequence();
+    } else {
+        // If it was closing, is fully closed, or was paused while closing, the reverse action is to OPEN.
+        execute_open_sequence();
+    }
 }
-void stop_button_pressed(Button2 &btn) { stop_movement(true); }
-void calibration_long_press(Button2 &btn) { start_calibration(); }
-// --- CORRECTED WiFi Config Portal Trigger ---
+
+// --- NEW: Context-aware handlers for the maintenance button ---
+void maintenance_button_short_press(Button2 &btn) {
+    if (rf_learn_state == RF_LEARN_INACTIVE) return; // Do nothing if not in learning mode
+
+    LOG_PRINTLN("Maintenance button (short press): Skipping current RF code.");
+    switch (rf_learn_state) {
+        case RF_LEARN_WAIT_OPEN:
+            LOG_PRINTLN("Skipped OPEN. Now press the desired CLOSE button...");
+            rf_learn_state = RF_LEARN_WAIT_CLOSE;
+            rf_learn_start_time = millis(); // Reset timeout
+            break;
+        case RF_LEARN_WAIT_CLOSE:
+            LOG_PRINTLN("Skipped CLOSE. Now press the desired STOP button...");
+            rf_learn_state = RF_LEARN_WAIT_STOP;
+            rf_learn_start_time = millis(); // Reset timeout
+            break;
+        case RF_LEARN_WAIT_STOP:
+            LOG_PRINTLN("Skipped STOP. Now press the desired 50% POSITION button...");
+            rf_learn_state = RF_LEARN_WAIT_POS50;
+            rf_learn_start_time = millis(); // Reset timeout
+            break;
+        case RF_LEARN_WAIT_POS50:
+            LOG_PRINTLN("Skipped 50% POSITION. Learning finished.");
+            // This is the end of the process, save and exit.
+            LOG_PRINTLN("--- RF Learning Complete! ---");
+            save_params();
+            rf_learn_state = RF_LEARN_INACTIVE;
+            blink_interval = 0;
+            maintenanceButton.setLongClickTime(CALIBRATION_LONG_PRESS_TIME); // Restore original time
+            break;
+        case RF_LEARN_INACTIVE:
+            break;
+    }
+}
+
+void maintenance_button_long_press(Button2 &btn) {
+    if (rf_learn_state != RF_LEARN_INACTIVE) {
+        // In learning mode, this is Save & Exit
+        LOG_PRINTLN("Maintenance button (long press): Saving learned codes and exiting RF learn mode.");
+        save_params();
+        rf_learn_state = RF_LEARN_INACTIVE;
+        blink_interval = 0;
+        maintenanceButton.setLongClickTime(CALIBRATION_LONG_PRESS_TIME); // Restore original time
+    } else {
+        // In normal mode, this is Calibrate
+        start_calibration();
+    }
+}
+
 void wifi_config_long_press(Button2 &btn)
 {
   LOG_PRINTLN("WiFi Config: Long press detected. Starting portal.");
@@ -313,7 +466,6 @@ void wifi_config_long_press(Button2 &btn)
 
   wm.setConfigPortalTimeout(180);
 
-  // This call is blocking. The save callback will handle saving the parameters.
   if (!wm.startConfigPortal("GateControllerAP"))
   {
     LOG_PRINTLN("WiFi Config: Portal timed out. No new WiFi connection.");
@@ -322,26 +474,39 @@ void wifi_config_long_press(Button2 &btn)
   {
     LOG_PRINTLN("WiFi Config: Portal exited successfully (new credentials may have been saved).");
   }
-
-  // After the portal is done, a restart is always the safest way to ensure a clean state
-  // and apply any new WiFi credentials or saved parameters.
+  
   LOG_PRINTLN("Exiting config mode. Restarting device...");
   delay(1000);
   ESP.restart();
 }
+
+// --- NEW: Short press on WiFi button to start RF learning ---
+void wifi_button_short_press(Button2 &btn) {
+    if (current_operation != IDLE || cal_state != CAL_INACTIVE) {
+        LOG_PRINTLN("Cannot start RF learning while gate is active.");
+        return;
+    }
+
+    rf_learn_state = RF_LEARN_WAIT_OPEN;
+    rf_learn_start_time = millis();
+    blink_interval = RF_LEARN_BLINK_INTERVAL;
+    maintenanceButton.setLongClickTime(RF_LEARN_SAVE_LONG_PRESS_TIME); // Set shorter time for save/exit
+    LOG_PRINTLN("--- RF Learning Mode Activated ---");
+    LOG_PRINTLN("Press the desired OPEN button on your remote...");
+    LOG_PRINTLN("Or, tap Maintenance button to skip, hold to save and exit.");
+}
+
 
 // =================================================================
 // Home Assistant Command Callbacks
 // =================================================================
 void onCoverCommand(HACover::CoverCommand cmd, HACover *sender)
 {
-  // FIX: Add guard to prevent normal commands during calibration
-  if (cal_state != CAL_INACTIVE)
+  if (cal_state != CAL_INACTIVE || rf_learn_state != RF_LEARN_INACTIVE)
   {
-    LOG_PRINTLN("Ignoring command: Calibration in progress.");
+    LOG_PRINTLN("Ignoring command: Maintenance/Learning in progress.");
     return;
   }
-  // Clear any specific position target when using standard open/close/stop
   target_position = -1.0;
   switch (cmd)
   {
@@ -367,8 +532,6 @@ void setup()
 
   LOG_PRINTLN("\nSliding Gate Controller Starting");
 
-  // Mount filesystem & init pins
-  // Mount filesystem
   if (!LittleFS.begin(true))
   {
     LOG_PRINTLN("LittleFS Mount Failed!");
@@ -428,38 +591,40 @@ void setup()
     current_position = 0.0;
     LOG_PRINTLN("Initial state: Gate position UNKNOWN (assuming CLOSED).");
   }
+  
+  mainButton.begin(MANUAL_MAIN_BUTTON_PIN, INPUT_PULLUP, true);
+  maintenanceButton.begin(MANUAL_MAINTENANCE_BUTTON_PIN, INPUT_PULLUP, true);
+  wifiButton.begin(MANUAL_WIFI_BUTTON_PIN, INPUT_PULLUP, true); 
 
-  buttonOpen.begin(MANUAL_OPEN_BUTTON_PIN, INPUT_PULLUP, true);
-  buttonClose.begin(MANUAL_CLOSE_BUTTON_PIN, INPUT_PULLUP, true);
-  buttonStop.begin(MANUAL_STOP_BUTTON_PIN, INPUT_PULLUP, true);
 
   wm.addParameter(&custom_mqtt_server);
   wm.addParameter(&custom_mqtt_port);
   wm.addParameter(&custom_mqtt_user);
   wm.addParameter(&custom_mqtt_password);
 
-  // --- (FIX) Define a callback that is triggered when WiFiManager saves configuration ---
-  // This is the key to reliably saving parameters, as it runs *before* the device restarts.
   wm.setSaveConfigCallback([]()
                            {
     LOG_PRINTLN("SaveConfigCallback triggered. Saving custom parameters...");
-    // Retrieve values from the parameter objects and store them in our global variables
     strncpy(mqtt_server, custom_mqtt_server.getValue(), sizeof(mqtt_server));
     strncpy(mqtt_port_str, custom_mqtt_port.getValue(), sizeof(mqtt_port_str));
     strncpy(mqtt_user, custom_mqtt_user.getValue(), sizeof(mqtt_user));
     strncpy(mqtt_password, custom_mqtt_password.getValue(), sizeof(mqtt_password));
 
-    // Now, explicitly save these global variables to LittleFS
     save_params(); });
 
-  buttonOpen.setPressedHandler(open_button_pressed);
-  buttonClose.setPressedHandler(close_button_pressed);
-  buttonStop.setPressedHandler(stop_button_pressed);
+  mainButton.setReleasedHandler(main_button_short_press);
+  mainButton.setLongClickHandler(main_button_long_press);
+  mainButton.setLongClickTime(REVERSE_LONG_PRESS_TIME);
 
-  buttonStop.setLongClickHandler(calibration_long_press);
-  buttonStop.setLongClickTime(CALIBRATION_LONG_PRESS_TIME);
-  buttonOpen.setLongClickHandler(wifi_config_long_press);
-  buttonOpen.setLongClickTime(WIFI_CONFIG_LONG_PRESS_TIME);
+  // --- NEW: Maintenance button is now context-aware ---
+  maintenanceButton.setReleasedHandler(maintenance_button_short_press);
+  maintenanceButton.setLongClickHandler(maintenance_button_long_press);
+  maintenanceButton.setLongClickTime(CALIBRATION_LONG_PRESS_TIME); // Default time for calibration
+
+  wifiButton.setReleasedHandler(wifi_button_short_press);
+  wifiButton.setLongClickHandler(wifi_config_long_press);
+  wifiButton.setLongClickTime(WIFI_CONFIG_LONG_PRESS_TIME);
+
 
   calibrateButton.setName("Calibrate");
   calibrateButton.setIcon("mdi:wrench");
@@ -472,17 +637,14 @@ void setup()
   gateIP.setUnitOfMeasurement("IP");
   gateIP.setIcon("mdi:ip");
 
-  // ← configure the new travel‐time sensor:
   travelTimeSensor.setName("Gate Travel Time");
   travelTimeSensor.setUnitOfMeasurement("s");
   travelTimeSensor.setIcon("mdi:timer");
 
-  // --- NEW: Configure HA Button entity for 50% position ---
   moveTo50Button.setName("Move Gate to 50%");
   moveTo50Button.setIcon("mdi:arrow-split-vertical");
   moveTo50Button.onCommand(onMoveTo50Command);
 
-  // Configure separate HA buttons
   openButtonHA.setName("Open Gate Button");
   openButtonHA.setIcon("mdi:arrow-up-box");
   openButtonHA.onCommand(onOpenCommand);
@@ -498,14 +660,14 @@ void setup()
   pinMode(RF_RECEIVER_PIN, INPUT);
   mySwitch.enableReceive(RF_RECEIVER_PIN);
 
-  // Don't connect automatically in setup, to keep it non-blocking
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true); // This is the key!
+  WiFi.setAutoReconnect(true); 
   WiFi.begin();
 
   LOG_PRINTLN("Setup complete.");
-  LOG_PRINTLN("Hold STOP for 2s to calibrate.");
-  LOG_PRINTLN("Hold OPEN for 2s for WiFi setup.");
+  LOG_PRINTLN("Hold STOP/MAINTENANCE button for 8s to calibrate.");
+  LOG_PRINTLN("Hold WIFI button (Pin 6) for 5s for WiFi setup.");
+  LOG_PRINTLN("Tap WIFI button (Pin 6) to enter RF Learning Mode.");
 
   LOG_PRINTLN("MQTT Configuration:");
   LOG_PRINTF(" - Server: %s\n", mqtt_server);
@@ -523,11 +685,9 @@ void setup()
 // ——— Main loop ———
 void loop()
 {
-
-  // --- MQTT layer ---
   if (WiFi.status() == WL_CONNECTED)
   {
-    mqtt.loop(); // ← critical for auto-reconnect
+    mqtt.loop(); 
 
     if (telnetServer.hasClient())
     {
@@ -541,7 +701,6 @@ void loop()
     }
   }
 
-  // send every 3 seconds
   static unsigned long last_publish_time = 0;
   if (millis() - last_publish_time > 3000)
   {
@@ -549,23 +708,26 @@ void loop()
     publish_all_states();
   }
 
-  buttonOpen.loop();
-  buttonClose.loop();
-  buttonStop.loop();
+  mainButton.loop();
+  maintenanceButton.loop();
+  wifiButton.loop();
 
-  handle_rf_signal();
+  
   handle_motor_relays();
-
-  // Periodically check WiFi status in the background
   handle_wifi_status();
-  handle_indicator_light(); // New handler for blinking light
-
-  if (cal_state != CAL_INACTIVE)
+  handle_indicator_light();
+  
+  if (rf_learn_state != RF_LEARN_INACTIVE)
+  {
+      handle_rf_learning();
+  }
+  else if (cal_state != CAL_INACTIVE)
   {
     handle_calibration();
   }
   else
   {
+    handle_rf_signal();
     handle_safety_sensors();
     if (current_operation != IDLE)
     {
@@ -600,14 +762,12 @@ void onCalibrateCommand(HAButton *sender)
   start_calibration();
 }
 
-// --- NEW: Callback for the HA Button ---
 void onMoveTo50Command(HAButton *sender)
 {
   LOG_PRINTLN("Received Move to 50% command from HA");
   move_to_position(0.5f);
 }
 
-// --- NEW: Logic to initiate movement to a specific position ---
 void move_to_position(float new_target)
 {
   if (cal_state != CAL_INACTIVE)
@@ -616,25 +776,20 @@ void move_to_position(float new_target)
     return;
   }
 
-  // --- FIX: Stop any current movement before starting a new one. ---
-  // This resets the state to IDLE, allowing a reversal of direction.
   if (current_operation != IDLE)
   {
     LOG_PRINTLN("Gate is currently moving, stopping first...");
-    stop_movement(false); // Programmatic stop, doesn't cancel user-intent
+    stop_movement(false); 
   }
 
-  // Check if we are already there (with a small tolerance)
   if (abs(current_position - new_target) < 0.01)
   {
     LOG_PRINTLN("Already at target position.");
     return;
   }
 
-  // Set the global target
   target_position = new_target;
 
-  // Decide whether to open or close
   if (new_target > current_position)
   {
     LOG_PRINTF("Moving to position %.2f by OPENING.\n", target_position);
@@ -647,22 +802,18 @@ void move_to_position(float new_target)
   }
 }
 
-// --- NEW ---
-// This function handles the blinking logic for the indicator light.
 void handle_indicator_light()
 {
-  // If blink_interval is 0, the gate is stopped, so make sure the light is off.
   if (blink_interval == 0)
   {
     if (indicator_light_state)
-    { // Only write if state needs to change
+    { 
       digitalWrite(RELAY_INDICATOR_LIGHT_PIN, LOW);
       indicator_light_state = false;
     }
     return;
   }
 
-  // If the blink interval has elapsed, toggle the light state.
   if (millis() - last_blink_time > blink_interval)
   {
     last_blink_time = millis();
@@ -671,10 +822,8 @@ void handle_indicator_light()
   }
 }
 
-// --- CORRECTED Non-Blocking WiFi Status Handler ---
 void handle_wifi_status()
 {
-  // This function just checks and prints the status. It does not block.
   if (millis() - last_wifi_check > WIFI_RETRY_INTERVAL)
   {
     last_wifi_check = millis();
@@ -684,6 +833,64 @@ void handle_wifi_status()
     }
   }
 }
+
+void handle_rf_learning() {
+    if (millis() - rf_learn_start_time > RF_LEARN_TIMEOUT) {
+        LOG_PRINTLN("RF Learning timed out. Exiting.");
+        rf_learn_state = RF_LEARN_INACTIVE;
+        blink_interval = 0;
+        maintenanceButton.setLongClickTime(CALIBRATION_LONG_PRESS_TIME); // Restore original time
+        return;
+    }
+
+    if (!mySwitch.available()) return;
+
+    unsigned long code = mySwitch.getReceivedValue();
+    mySwitch.resetAvailable();
+    if (code == 0) return;
+
+    LOG_PRINTF("Received potential RF code: %lu\n", code);
+
+    switch (rf_learn_state) {
+        case RF_LEARN_WAIT_OPEN:
+            rf_gate_open_code = code;
+            LOG_PRINTF("=> OPEN code learned: %lu\n", rf_gate_open_code);
+            LOG_PRINTLN("Now press the desired CLOSE button on your remote...");
+            rf_learn_state = RF_LEARN_WAIT_CLOSE;
+            rf_learn_start_time = millis(); 
+            break;
+
+        case RF_LEARN_WAIT_CLOSE:
+            rf_gate_close_code = code;
+            LOG_PRINTF("=> CLOSE code learned: %lu\n", rf_gate_close_code);
+            LOG_PRINTLN("Now press the desired STOP button on your remote...");
+            rf_learn_state = RF_LEARN_WAIT_STOP;
+            rf_learn_start_time = millis(); 
+            break;
+
+        case RF_LEARN_WAIT_STOP:
+            rf_gate_stop_code = code;
+            LOG_PRINTF("=> STOP code learned: %lu\n", rf_gate_stop_code);
+            LOG_PRINTLN("Now press the desired 50% POSITION button on your remote...");
+            rf_learn_state = RF_LEARN_WAIT_POS50;
+            rf_learn_start_time = millis(); 
+            break;
+
+        case RF_LEARN_WAIT_POS50:
+            rf_gate_pos50_code = code;
+            LOG_PRINTF("=> 50% POSITION code learned: %lu\n", rf_gate_pos50_code);
+            LOG_PRINTLN("--- RF Learning Complete! ---");
+            save_params(); 
+            rf_learn_state = RF_LEARN_INACTIVE;
+            blink_interval = 0; 
+            maintenanceButton.setLongClickTime(CALIBRATION_LONG_PRESS_TIME); // Restore original time
+            break;
+
+        case RF_LEARN_INACTIVE:
+            break;
+    }
+}
+
 
 void handle_rf_signal()
 {
@@ -697,31 +904,26 @@ void handle_rf_signal()
     char code_str[20];
     sprintf(code_str, "%lu", last_rf_code_received);
     rfCodeSensor.setValue(code_str);
+    LOG_PRINTF("RF code received: %lu\n", code);
   }
-  switch (code)
-  {
-  case RF_GATE_OPEN_CODE:
-    target_position = -1.0;
-    start_opening();
-    break;
-  case RF_GATE_CLOSE_CODE:
-    target_position = -1.0;
-    start_closing();
-    break;
-  case RF_GATE_STOP_CODE:
-    stop_movement(true);
-    break;
-  case RF_GATE_POS50_CODE:
-    LOG_PRINTLN("RF command: Move to 50%");
-    move_to_position(0.5f);
-    break;
+
+  if (code == rf_gate_open_code) {
+      target_position = -1.0;
+      start_opening();
+  } else if (code == rf_gate_close_code) {
+      target_position = -1.0;
+      start_closing();
+  } else if (code == rf_gate_stop_code) {
+      stop_movement(true);
+  } else if (code == rf_gate_pos50_code) {
+      LOG_PRINTLN("RF command: Move to 50%");
+      move_to_position(0.5f);
   }
 }
 
 void handle_motor_relays()
 {
 #if MOTOR_CONTROL_MODE == 1
-  // This logic is for Mode 1 only (Direction + Enable relays)
   if (motor_relay_state == R_OFF)
     return;
   if (millis() - motor_relay_timer >= MOTOR_DIRECTION_DELAY)
@@ -736,7 +938,6 @@ void handle_motor_relays()
     }
   }
 #elif MOTOR_CONTROL_MODE == 2
-  // This logic is for Mode 2 only (Open + Close relays with delay)
   if (motor_change_state == M_WAIT_FOR_ENGAGE)
   {
     if (millis() - motor_change_timer >= MOTOR_DIRECTION_DELAY)
@@ -753,7 +954,6 @@ void handle_motor_relays()
       }
       motor_change_state = M_IDLE;
       next_operation = IDLE;
-      // Start the movement timer now that the motor is actually engaged
       movement_start_time = millis();
       movement_start_position = current_position;
     }
@@ -763,29 +963,20 @@ void handle_motor_relays()
 
 void execute_open_sequence()
 {
-#if MOTOR_CONTROL_MODE == 1
-  if (current_operation != IDLE || motor_relay_state != R_OFF)
-    return;
-#else // Mode 2
-  if (current_operation != IDLE)
-    return;
-#endif
+  if (current_operation == OPENING) return;
 
   current_operation = OPENING;
   if (WiFi.status() == WL_CONNECTED)
   {
     cover.setState(HACover::StateOpening);
   }
-  blink_interval = BLINK_INTERVAL_OPENING; // Set slow blink
+  blink_interval = BLINK_INTERVAL_OPENING; 
 
 #if MOTOR_CONTROL_MODE == 1
   digitalWrite(RELAY_MOTOR_DIRECTION_PIN, LOW);
   motor_relay_timer = millis();
   motor_relay_state = R_WAIT_ENABLE;
 #elif MOTOR_CONTROL_MODE == 2
-  // In Mode 2, we turn off both relays first, then wait for a delay
-  // handled by handle_motor_relays() before turning the correct one on.
-  // This is a safety feature to prevent shorting the motor driver.
   digitalWrite(RELAY_MOTOR_OPEN_PIN, LOW);
   digitalWrite(RELAY_MOTOR_CLOSE_PIN, LOW);
   LOG_PRINTLN("Motor Opening (Mode 2), waiting for relay delay.");
@@ -793,34 +984,25 @@ void execute_open_sequence()
   motor_change_state = M_WAIT_FOR_ENGAGE;
   motor_change_timer = millis();
   next_operation = OPENING;
-  // movement_start_time is now set inside handle_motor_relays()
 #endif
 }
 
 void execute_close_sequence()
 {
-#if MOTOR_CONTROL_MODE == 1
-  if (current_operation != IDLE || motor_relay_state != R_OFF)
-    return;
-#else // Mode 2
-  if (current_operation != IDLE)
-    return;
-#endif
+  if (current_operation == CLOSING) return;
 
   current_operation = CLOSING;
   if (WiFi.status() == WL_CONNECTED)
   {
     cover.setState(HACover::StateClosing);
   }
-  blink_interval = BLINK_INTERVAL_CLOSING; // Set fast blink
+  blink_interval = BLINK_INTERVAL_CLOSING; 
 
 #if MOTOR_CONTROL_MODE == 1
   digitalWrite(RELAY_MOTOR_DIRECTION_PIN, HIGH);
   motor_relay_timer = millis();
   motor_relay_state = R_WAIT_ENABLE;
 #elif MOTOR_CONTROL_MODE == 2
-  // In Mode 2, we turn off both relays first, then wait for a delay
-  // handled by handle_motor_relays() before turning the correct one on.
   digitalWrite(RELAY_MOTOR_OPEN_PIN, LOW);
   digitalWrite(RELAY_MOTOR_CLOSE_PIN, LOW);
   LOG_PRINTLN("Motor Closing (Mode 2), waiting for relay delay.");
@@ -828,13 +1010,12 @@ void execute_close_sequence()
   motor_change_state = M_WAIT_FOR_ENGAGE;
   motor_change_timer = millis();
   next_operation = CLOSING;
-  // movement_start_time is now set inside handle_motor_relays()
 #endif
 }
 
 void start_opening()
 {
-
+  last_operation_before_stop = IDLE; 
   if (current_operation != IDLE || cal_state != CAL_INACTIVE)
     return;
   if (current_position >= 0.99f || digitalRead(LIMIT_OPEN_PIN) == LOW)
@@ -853,6 +1034,7 @@ void start_opening()
 
 void start_closing()
 {
+  last_operation_before_stop = IDLE; 
   if (current_operation != IDLE || cal_state != CAL_INACTIVE)
     return;
   if (current_position <= 0.01f || digitalRead(LIMIT_CLOSE_PIN) == LOW)
@@ -873,6 +1055,15 @@ void stop_movement(bool triggered_by_user)
 {
   if (current_operation == IDLE && cal_state == CAL_INACTIVE && !auto_resume_is_armed && !resume_countdown_is_active)
     return;
+
+  if (triggered_by_user && current_operation != IDLE) {
+      if (current_position > 0.01f && current_position < 0.99f) {
+          last_operation_before_stop = current_operation;
+      } else {
+          last_operation_before_stop = IDLE; 
+      }
+  }
+
   if (current_operation != IDLE || auto_resume_is_armed || resume_countdown_is_active)
   {
     LOG_PRINTLN("Command: STOP");
@@ -886,12 +1077,11 @@ void stop_movement(bool triggered_by_user)
   LOG_PRINTLN("Motor Stopped (Mode 2).");
   digitalWrite(RELAY_MOTOR_OPEN_PIN, LOW);
   digitalWrite(RELAY_MOTOR_CLOSE_PIN, LOW);
-  // Also cancel any pending direction change
   motor_change_state = M_IDLE;
   next_operation = IDLE;
 #endif
 
-  blink_interval = 0; // Stop blinking
+  blink_interval = 0; 
   current_operation = IDLE;
 
   if (WiFi.status() == WL_CONNECTED)
@@ -903,11 +1093,11 @@ void stop_movement(bool triggered_by_user)
     else
       cover.setState(HACover::StateStopped);
   }
-  cover.setCurrentPosition(current_position * 100); // Immediately publish position with state
+  cover.setCurrentPosition(current_position * 100); 
 
   if (triggered_by_user)
   {
-    target_position = -1.0; // <-- NEW: Cancel target on manual stop
+    target_position = -1.0; 
     if (cal_state != CAL_INACTIVE)
     {
       LOG_PRINTLN("Calibration cancelled by user.");
@@ -925,11 +1115,9 @@ void stop_movement(bool triggered_by_user)
 void update_gate_position()
 {
 #if MOTOR_CONTROL_MODE == 1
-  // In mode 1, don't update position until the motor enable relay is active
   if (motor_relay_state != R_OFF)
     return;
 #elif MOTOR_CONTROL_MODE == 2
-  // In mode 2, don't update position until the motor is actually engaged after the delay
   if (motor_change_state != M_IDLE)
     return;
 #endif
@@ -946,7 +1134,6 @@ void update_gate_position()
     const char *stateStr = (current_operation == OPENING) ? "OPENING" : "CLOSING";
     LOG_PRINTF("Position: %.2f  State: %s\n", current_position, stateStr);
   }
-  // --- FIXED: Check if we have a specific target and have reached or passed it ---
   if (target_position >= 0.0)
   {
     if ((current_operation == OPENING && current_position >= target_position) ||
@@ -955,15 +1142,15 @@ void update_gate_position()
 
       LOG_PRINTF("Target position %.2f reached.\n", target_position);
       stop_movement(false);
-      current_position = target_position; // Snap to the exact position for accuracy
-      target_position = -1.0;              // Reset the target
+      current_position = target_position; 
+      target_position = -1.0;              
     }
   }
   if (elapsed > gate_travel_time)
   {
     LOG_PRINTLN("Error: Gate movement timed out!");
     stop_movement(false);
-    target_position = -1.0; // <-- NEW: Clear target at hard limit
+    target_position = -1.0; 
   }
 }
 
@@ -980,24 +1167,23 @@ void handle_safety_sensors()
     LOG_PRINTLN("Limit: OPEN reached");
     stop_movement(false);
     current_position = 1.0f;
-    target_position = -1.0; // <-- NEW: Clear target at hard limit
+    target_position = -1.0; 
   }
   if (current_operation == CLOSING && digitalRead(LIMIT_CLOSE_PIN) == LOW)
   {
     LOG_PRINTLN("Limit: CLOSE reached");
     stop_movement(false);
     current_position = 0.0f;
-    target_position = -1.0; // <-- NEW: Clear target at hard limit
+    target_position = -1.0; 
   }
   bool is_path_blocked = (digitalRead(PHOTO_BARRIER_PIN) == LOW);
-  static bool was_path_blocked = false;
-  if (is_path_blocked && !was_path_blocked && current_operation == CLOSING)
+  if (is_path_blocked && current_operation == CLOSING)
   {
     LOG_PRINTLN("Photo Barrier: Obstacle detected. Reversing fully.");
     stop_movement(false);
     auto_resume_is_armed = true;
     resume_countdown_is_active = false;
-    target_position = -1.0; // Cancel target on photo barrier trigger
+    target_position = -1.0; 
     execute_open_sequence();
   }
   if (auto_resume_is_armed)
@@ -1035,15 +1221,14 @@ void handle_safety_sensors()
       }
     }
   }
-  was_path_blocked = is_path_blocked;
 }
 void start_calibration()
 {
-  if (current_operation != IDLE || cal_state != CAL_INACTIVE)
+  if (current_operation != IDLE || cal_state != CAL_INACTIVE || rf_learn_state != RF_LEARN_INACTIVE)
     return;
   LOG_PRINTLN("--- Starting Gate Calibration ---");
   cal_state = CAL_CLOSING_TO_START;
-  blink_interval = CALIBRATION_BLINK_INTERVAL; // Set fast blink for calibration
+  blink_interval = CALIBRATION_BLINK_INTERVAL; 
 }
 void handle_calibration()
 {
