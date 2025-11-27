@@ -8,24 +8,33 @@
 #include <stdlib.h>
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
-#include <Preferences.h> // [NEW] To store Boot Count
+#include <Preferences.h>
 
 // --- CONFIGURATION ---
-#define ENABLE_WATCHDOG true
-#define WDT_TIMEOUT_SECONDS 10
-#define MAX_LOG_SIZE 5000 // [NEW] Max log size in bytes (5KB)
+#define ENABLE_HW_WATCHDOG true
+#define HW_WDT_TIMEOUT 20      // Hardware WDT (Failsafe)
+#define SOFT_WDT_TIMEOUT 10000 // Software Monitor Timeout
+#define MAX_LOG_SIZE 5000
 
-// Define global handles
 SemaphoreHandle_t xLogMutex = NULL;
 WiFiClient telnetClient;
 
 #include "SerialMirror.hpp"
-
-// --- FreeRTOS Includes ---
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+
+// --- WATCHDOG TRACKERS ---
+volatile unsigned long last_checkin_motor = 0;
+volatile unsigned long last_checkin_network = 0;
+volatile unsigned long last_checkin_input = 0;
+volatile unsigned long last_checkin_gate = 0;
+
+// Simulation Flags
+bool simulate_crash_motor = false;
+bool simulate_crash_network = false;
+bool simulate_crash_input = false;
 
 // --- Command Structure ---
 enum GateCommand
@@ -50,13 +59,11 @@ typedef struct
     float position;
 } CommandMessage;
 
-// --- RTOS Global Objects ---
 QueueHandle_t xCommandQueue;
 SemaphoreHandle_t xStateMutex;
 SemaphoreHandle_t xMotorRelayMutex;
 TaskHandle_t hNetworkTask = NULL;
 
-// --- PREFERENCES (Boot Count) ---
 Preferences preferences;
 unsigned int bootCount = 0;
 
@@ -82,7 +89,6 @@ const int LIMIT_CLOSE_PIN = 20;
 const int PHOTO_BARRIER_PIN = 2;
 const int RF_RECEIVER_PIN = 5;
 
-// ——— Timing constants ———
 unsigned long MOTOR_DIRECTION_DELAY = 700;
 unsigned long CALIBRATION_LONG_PRESS_TIME = 8000;
 unsigned long WIFI_CONFIG_LONG_PRESS_TIME = 5000;
@@ -93,7 +99,6 @@ const unsigned long RF_LEARN_SAVE_LONG_PRESS_TIME = 1500;
 const unsigned long RF_DEBOUNCE_DELAY = 400;
 const unsigned long COMBO_MODE_HOLD_TIME = 2000;
 
-// Persistent parameters
 unsigned long gate_travel_time = 30000;
 char mqtt_server[40] = "192.168.1.12";
 char mqtt_port_str[6] = "1883";
@@ -120,9 +125,6 @@ bool indicator_light_state = false;
 #define CALIBRATION_BLINK_INTERVAL 100
 #define RF_LEARN_BLINK_INTERVAL 250
 
-// =================================================================
-// Global State Variables
-// =================================================================
 enum CoverOperation
 {
     IDLE,
@@ -229,35 +231,32 @@ void check_reset_reason();
 void dump_system_log();
 void vConfigPortalTask(void *pvParameters);
 void log_io_status();
+void log_system_error(const char *msg);
 
 // =================================================================
-// Logging & Maintenance
+// LOGGING & WATCHDOG
 // =================================================================
 
 void log_system_error(const char *msg)
 {
-    // [NEW] Check size before appending
     if (LittleFS.exists(LOG_FILE))
     {
         File f = LittleFS.open(LOG_FILE, "r");
         if (f.size() > MAX_LOG_SIZE)
         {
             f.close();
-            LittleFS.remove(LOG_FILE); // Delete old file
+            LittleFS.remove(LOG_FILE);
             File fNew = LittleFS.open(LOG_FILE, "w");
-            fNew.println("--- LOG ROTATED (Size Limit) ---");
+            fNew.println("--- LOG ROTATED ---");
             fNew.close();
         }
         else
-        {
             f.close();
-        }
     }
 
     File logFile = LittleFS.open(LOG_FILE, "a");
     if (logFile)
     {
-        // [NEW] Cleaner format: [Boot #45] Reason
         logFile.print("[Boot #");
         logFile.print(bootCount);
         logFile.print("] ");
@@ -270,22 +269,22 @@ void dump_system_log()
 {
     if (!LittleFS.exists(LOG_FILE))
     {
-        LOG_PRINTLN("No logs found.");
+        LOG_PRINTLN("No logs.");
         return;
     }
-    LOG_PRINTLN("\n--- SYSTEM LOG HISTORY ---");
+    LOG_PRINTLN("\n--- LOGS ---");
     File logFile = LittleFS.open(LOG_FILE, "r");
     if (logFile)
     {
         while (logFile.available())
         {
-            if (ENABLE_WATCHDOG)
+            if (ENABLE_HW_WATCHDOG)
                 esp_task_wdt_reset();
             TelnetLogger.write(logFile.read());
         }
         logFile.close();
     }
-    LOG_PRINTLN("\n--------------------------\n");
+    LOG_PRINTLN("\n------------\n");
 }
 
 void check_reset_reason()
@@ -303,37 +302,83 @@ void check_reset_reason()
         reason_str = "Software Reset";
         break;
     case ESP_RST_PANIC:
-        reason_str = "Crash/Panic (Error)";
+        reason_str = "Crash/Panic";
         save_log = true;
         break;
     case ESP_RST_TASK_WDT:
-        reason_str = "Task Watchdog (Hung Task)";
+        reason_str = "HW Watchdog (Hang)";
         save_log = true;
         break;
     case ESP_RST_WDT:
-        reason_str = "Interrupt Watchdog";
+        reason_str = "Interrupt WDT";
         save_log = true;
         break;
     case ESP_RST_BROWNOUT:
-        reason_str = "Brownout (Low Voltage)";
+        reason_str = "Brownout";
         save_log = true;
         break;
     default:
         break;
     }
-
     LOG_PRINTF("Boot #%u | Reason: %s\n", bootCount, reason_str);
-
     if (save_log)
-    {
         log_system_error(reason_str);
-        LOG_PRINTLN("!! Reset Logged !!");
+}
+
+// --- SUPERVISOR TASK (Software Watchdog) ---
+void vSupervisorTask(void *pvParameters)
+{
+    if (ENABLE_HW_WATCHDOG)
+        esp_task_wdt_add(NULL);
+
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (ENABLE_HW_WATCHDOG)
+            esp_task_wdt_reset();
+
+        unsigned long now = millis();
+
+        // Check if tasks are alive (only check if system has been up for > 15s to allow init)
+        if (millis() > 15000)
+        {
+            if (now - last_checkin_network > SOFT_WDT_TIMEOUT)
+            {
+                LOG_PRINTLN("CRITICAL: Network Task Stuck!");
+                log_system_error("CRASH: Network Task Hung");
+                delay(500);
+                ESP.restart();
+            }
+            if (now - last_checkin_motor > SOFT_WDT_TIMEOUT)
+            {
+                LOG_PRINTLN("CRITICAL: Motor Task Stuck!");
+                log_system_error("CRASH: Motor/Safety Task Hung");
+                delay(500);
+                ESP.restart();
+            }
+            if (now - last_checkin_input > SOFT_WDT_TIMEOUT)
+            {
+                LOG_PRINTLN("CRITICAL: Input Task Stuck!");
+                log_system_error("CRASH: Input/RF Task Hung");
+                delay(500);
+                ESP.restart();
+            }
+            if (now - last_checkin_gate > SOFT_WDT_TIMEOUT)
+            {
+                LOG_PRINTLN("CRITICAL: Gate Logic Stuck!");
+                log_system_error("CRASH: Gate State Task Hung");
+                delay(500);
+                ESP.restart();
+            }
+        }
     }
 }
 
+// =================================================================
+// Parameters & IO
+// =================================================================
 void save_params()
 {
-    LOG_PRINTLN("Saving config...");
     JsonDocument doc;
     doc["gate_travel_time"] = gate_travel_time;
     doc["mqtt_server"] = mqtt_server;
@@ -344,23 +389,24 @@ void save_params()
     doc["rf_gate_close_code"] = rf_gate_close_code;
     doc["rf_gate_stop_code"] = rf_gate_stop_code;
     doc["rf_gate_pos50_code"] = rf_gate_pos50_code;
-
-    File configFile = LittleFS.open(PARAMS_FILE, "w");
-    if (!configFile)
-        return;
-    serializeJson(doc, configFile);
-    configFile.close();
+    File f = LittleFS.open(PARAMS_FILE, "w");
+    if (f)
+    {
+        serializeJson(doc, f);
+        f.close();
+        LOG_PRINTLN("Config saved.");
+    }
 }
 
 void load_params()
 {
     if (LittleFS.exists(PARAMS_FILE))
     {
-        File configFile = LittleFS.open(PARAMS_FILE, "r");
-        if (configFile)
+        File f = LittleFS.open(PARAMS_FILE, "r");
+        if (f)
         {
             JsonDocument doc;
-            deserializeJson(doc, configFile);
+            deserializeJson(doc, f);
             gate_travel_time = doc["gate_travel_time"] | gate_travel_time;
             strncpy(mqtt_server, doc["mqtt_server"] | mqtt_server, sizeof(mqtt_server));
             strncpy(mqtt_port_str, doc["mqtt_port"] | mqtt_port_str, sizeof(mqtt_port_str));
@@ -370,13 +416,11 @@ void load_params()
             rf_gate_close_code = doc["rf_gate_close_code"] | rf_gate_close_code;
             rf_gate_stop_code = doc["rf_gate_stop_code"] | rf_gate_stop_code;
             rf_gate_pos50_code = doc["rf_gate_pos50_code"] | rf_gate_pos50_code;
-            configFile.close();
+            f.close();
         }
     }
     else
-    {
         save_params();
-    }
 }
 
 void send_command(GateCommand cmd, float pos = -1.0f)
@@ -410,12 +454,11 @@ void log_io_status()
 }
 
 // =================================================================
-// Button Callbacks
+// Button & HA Callbacks
 // =================================================================
 void main_button_short_press(Button2 &btn) { send_command(CMD_STOP_USER); }
 void main_button_long_press(Button2 &btn) { send_command(CMD_REVERSE); }
 void maintenance_button_short_press(Button2 &btn) { send_command(CMD_RF_LEARN_SKIP); }
-
 void maintenance_button_long_press(Button2 &btn)
 {
     if (xSemaphoreTake(xStateMutex, 0) == pdTRUE)
@@ -433,9 +476,6 @@ void maintenance_button_long_press(Button2 &btn)
 void wifi_button_short_press(Button2 &btn) {}
 void wifi_config_long_press(Button2 &btn) { send_command(CMD_WIFI_CONFIG_START); }
 
-// =================================================================
-// HA & Logic
-// =================================================================
 void onCoverCommand(HACover::CoverCommand cmd, HACover *sender)
 {
     switch (cmd)
@@ -463,7 +503,6 @@ void publish_all_states()
     char buf[16];
     snprintf(buf, sizeof(buf), "%lu", gate_travel_time / 1000);
     travelTimeSensor.setValue(buf);
-
     if (cal_state != CAL_INACTIVE)
         gateState.setValue("calibrating");
     else if (rf_learn_state != RF_LEARN_INACTIVE)
@@ -472,9 +511,9 @@ void publish_all_states()
         gateState.setValue("opening");
     else if (current_operation == CLOSING)
         gateState.setValue("closing");
-    else if (current_position == 1.0f)
+    else if (current_position >= 0.99f)
         gateState.setValue("open");
-    else if (current_position == 0.0f)
+    else if (current_position <= 0.01f)
         gateState.setValue("closed");
     else
         gateState.setValue("stopped");
@@ -529,7 +568,6 @@ void handle_rf_learning()
 {
     if (millis() - rf_learn_start_time > RF_LEARN_TIMEOUT)
     {
-        LOG_PRINTLN("RF Learning timed out.");
         rf_learn_state = RF_LEARN_INACTIVE;
         blink_interval = 0;
         maintenanceButton.setLongClickTime(CALIBRATION_LONG_PRESS_TIME);
@@ -541,7 +579,6 @@ void handle_rf_learning()
     mySwitch.resetAvailable();
     if (code == 0)
         return;
-
     LOG_PRINTF("RF LEARN | Code: %lu\n", code);
     switch (rf_learn_state)
     {
@@ -583,7 +620,6 @@ void handle_rf_signal()
     unsigned long code = mySwitch.getReceivedValue();
     unsigned long now = millis();
     bool is_repeat = false;
-
     if (code == last_rf_code_received)
     {
         if (now - last_rf_process_time < RF_DEBOUNCE_DELAY)
@@ -592,15 +628,12 @@ void handle_rf_signal()
     last_rf_code_received = code;
     last_rf_process_time = now;
     mySwitch.resetAvailable();
-
     if (code == 0 || is_repeat)
         return;
-
     char code_str[20];
     sprintf(code_str, "%lu", last_rf_code_received);
     rfCodeSensor.setValue(code_str);
     LOG_PRINTF("RF RX: %lu\n", code);
-
     if (code == rf_gate_open_code)
         send_command(CMD_OPEN);
     else if (code == rf_gate_close_code)
@@ -626,7 +659,6 @@ void handle_motor_relays()
                 xSemaphoreGive(xMotorRelayMutex);
             }
             motor_relay_state = R_OFF;
-            LOG_PRINTLN("Motor: Enabled");
             movement_start_time = millis();
             movement_start_position = current_position;
         }
@@ -639,15 +671,9 @@ void handle_motor_relays()
             if (xSemaphoreTake(xMotorRelayMutex, pdMS_TO_TICKS(1)) == pdTRUE)
             {
                 if (next_operation == OPENING)
-                {
                     digitalWrite(RELAY_MOTOR_OPEN_PIN, HIGH);
-                    LOG_PRINTLN("Motor: Opening");
-                }
                 else if (next_operation == CLOSING)
-                {
                     digitalWrite(RELAY_MOTOR_CLOSE_PIN, HIGH);
-                    LOG_PRINTLN("Motor: Closing");
-                }
                 xSemaphoreGive(xMotorRelayMutex);
             }
             motor_change_state = M_IDLE;
@@ -667,7 +693,6 @@ void execute_open_sequence()
     if (WiFi.status() == WL_CONNECTED)
         cover.setState(HACover::StateOpening);
     blink_interval = BLINK_INTERVAL_OPENING;
-
     if (xSemaphoreTake(xMotorRelayMutex, pdMS_TO_TICKS(10)) == pdTRUE)
     {
 #if MOTOR_CONTROL_MODE == 1
@@ -693,7 +718,6 @@ void execute_close_sequence()
     if (WiFi.status() == WL_CONNECTED)
         cover.setState(HACover::StateClosing);
     blink_interval = BLINK_INTERVAL_CLOSING;
-
     if (xSemaphoreTake(xMotorRelayMutex, pdMS_TO_TICKS(10)) == pdTRUE)
     {
 #if MOTOR_CONTROL_MODE == 1
@@ -744,124 +768,7 @@ void start_closing()
     execute_close_sequence();
 }
 
-void stop_movement(bool triggered_by_user)
-{
-    if (current_operation == IDLE && cal_state == CAL_INACTIVE && !auto_resume_is_armed && !resume_countdown_is_active)
-        return;
-
-    if (triggered_by_user && current_operation != IDLE)
-    {
-        if (current_position > 0.01f && current_position < 0.99f)
-            last_operation_before_stop = current_operation;
-        else
-            last_operation_before_stop = IDLE;
-    }
-
-    if (xSemaphoreTake(xMotorRelayMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-    {
-#if MOTOR_CONTROL_MODE == 1
-        digitalWrite(RELAY_MOTOR_ENABLE_PIN, LOW);
-        digitalWrite(RELAY_MOTOR_DIRECTION_PIN, LOW);
-        motor_relay_state = R_OFF;
-#elif MOTOR_CONTROL_MODE == 2
-        digitalWrite(RELAY_MOTOR_OPEN_PIN, LOW);
-        digitalWrite(RELAY_MOTOR_CLOSE_PIN, LOW);
-        motor_change_state = M_IDLE;
-        next_operation = IDLE;
-#endif
-        xSemaphoreGive(xMotorRelayMutex);
-    }
-
-    blink_interval = 0;
-    current_operation = IDLE;
-    LOG_PRINTLN("STOP executed.");
-
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        if (current_position >= 0.99f)
-            cover.setState(HACover::StateOpen);
-        else if (current_position <= 0.01f)
-            cover.setState(HACover::StateClosed);
-        else
-            cover.setState(HACover::StateStopped);
-    }
-    cover.setCurrentPosition(current_position * 100);
-
-    if (triggered_by_user)
-    {
-        target_position = -1.0;
-        if (cal_state != CAL_INACTIVE)
-            cal_state = CAL_INACTIVE;
-        auto_resume_is_armed = false;
-        resume_countdown_is_active = false;
-    }
-}
-
-void update_gate_position()
-{
-#if MOTOR_CONTROL_MODE == 1
-    if (motor_relay_state != R_OFF)
-        return;
-#elif MOTOR_CONTROL_MODE == 2
-    if (motor_change_state != M_IDLE)
-        return;
-#endif
-
-    unsigned long elapsed = millis() - movement_start_time;
-    float ratio = (gate_travel_time > 0) ? (float(elapsed) / float(gate_travel_time)) : 1.0f;
-
-    if (current_operation == OPENING)
-        current_position = movement_start_position + ratio;
-    else if (current_operation == CLOSING)
-        current_position = movement_start_position - ratio;
-
-    current_position = constrain(current_position, 0.0f, 1.0f);
-
-    if (target_position >= 0.0)
-    {
-        if ((current_operation == OPENING && current_position >= target_position) ||
-            (current_operation == CLOSING && current_position <= target_position))
-        {
-            LOG_PRINTF("Target %.2f reached.\n", target_position);
-            stop_movement(false);
-            current_position = target_position;
-            target_position = -1.0;
-        }
-    }
-    if (gate_travel_time > 0 && elapsed > (gate_travel_time + (gate_travel_time / 10)))
-    {
-        LOG_PRINTLN("Error: Gate movement timed out!");
-        stop_movement(false);
-        target_position = -1.0;
-    }
-}
-
-void handle_safety_sensors()
-{
-    if (current_operation == OPENING && digitalRead(LIMIT_OPEN_PIN) == LOW)
-    {
-        LOG_PRINTLN("Limit: OPEN reached");
-        stop_movement(false);
-        current_position = 1.0f;
-        target_position = -1.0;
-    }
-    if (current_operation == CLOSING && digitalRead(LIMIT_CLOSE_PIN) == LOW)
-    {
-        LOG_PRINTLN("Limit: CLOSE reached");
-        stop_movement(false);
-        current_position = 0.0f;
-        target_position = -1.0;
-    }
-
-    if (digitalRead(PHOTO_BARRIER_PIN) == LOW && current_operation == CLOSING)
-    {
-        LOG_PRINTLN("Photo Barrier! Reversing.");
-        stop_movement(false);
-        auto_resume_is_armed = true;
-        target_position = -1.0;
-        execute_open_sequence();
-    }
-}
+// --- MISSING FUNCTIONS RESTORED ---
 
 void start_calibration()
 {
@@ -908,18 +815,118 @@ void handle_calibration()
     }
 }
 
+// ------------------------------------
+
+void stop_movement(bool triggered_by_user)
+{
+    if (current_operation == IDLE && cal_state == CAL_INACTIVE && !auto_resume_is_armed)
+        return;
+    if (triggered_by_user && current_operation != IDLE)
+        last_operation_before_stop = (current_position > 0.01f && current_position < 0.99f) ? current_operation : IDLE;
+    if (xSemaphoreTake(xMotorRelayMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+#if MOTOR_CONTROL_MODE == 1
+        digitalWrite(RELAY_MOTOR_ENABLE_PIN, LOW);
+        digitalWrite(RELAY_MOTOR_DIRECTION_PIN, LOW);
+        motor_relay_state = R_OFF;
+#elif MOTOR_CONTROL_MODE == 2
+        digitalWrite(RELAY_MOTOR_OPEN_PIN, LOW);
+        digitalWrite(RELAY_MOTOR_CLOSE_PIN, LOW);
+        motor_change_state = M_IDLE;
+        next_operation = IDLE;
+#endif
+        xSemaphoreGive(xMotorRelayMutex);
+    }
+    blink_interval = 0;
+    current_operation = IDLE;
+    LOG_PRINTLN("STOP executed.");
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        if (current_position >= 0.99f)
+            cover.setState(HACover::StateOpen);
+        else if (current_position <= 0.01f)
+            cover.setState(HACover::StateClosed);
+        else
+            cover.setState(HACover::StateStopped);
+    }
+    cover.setCurrentPosition(current_position * 100);
+    if (triggered_by_user)
+    {
+        target_position = -1.0;
+        if (cal_state != CAL_INACTIVE)
+            cal_state = CAL_INACTIVE;
+        auto_resume_is_armed = false;
+    }
+}
+
+void update_gate_position()
+{
+#if MOTOR_CONTROL_MODE == 1
+    if (motor_relay_state != R_OFF)
+        return;
+#elif MOTOR_CONTROL_MODE == 2
+    if (motor_change_state != M_IDLE)
+        return;
+#endif
+    unsigned long elapsed = millis() - movement_start_time;
+    float ratio = (gate_travel_time > 0) ? (float(elapsed) / float(gate_travel_time)) : 1.0f;
+    if (current_operation == OPENING)
+        current_position = movement_start_position + ratio;
+    else if (current_operation == CLOSING)
+        current_position = movement_start_position - ratio;
+    current_position = constrain(current_position, 0.0f, 1.0f);
+    if (target_position >= 0.0)
+    {
+        if ((current_operation == OPENING && current_position >= target_position) ||
+            (current_operation == CLOSING && current_position <= target_position))
+        {
+            stop_movement(false);
+            current_position = target_position;
+            target_position = -1.0;
+        }
+    }
+    if (gate_travel_time > 0 && elapsed > (gate_travel_time + 3000))
+    {
+        LOG_PRINTLN("Timeout!");
+        stop_movement(false);
+        target_position = -1.0;
+    }
+}
+
+void handle_safety_sensors()
+{
+    if (current_operation == OPENING && digitalRead(LIMIT_OPEN_PIN) == LOW)
+    {
+        stop_movement(false);
+        current_position = 1.0f;
+    }
+    if (current_operation == CLOSING && digitalRead(LIMIT_CLOSE_PIN) == LOW)
+    {
+        stop_movement(false);
+        current_position = 0.0f;
+    }
+    if (digitalRead(PHOTO_BARRIER_PIN) == LOW && current_operation == CLOSING)
+    {
+        LOG_PRINTLN("Barrier!");
+        stop_movement(false);
+        auto_resume_is_armed = true;
+        execute_open_sequence();
+    }
+}
+
 // =================================================================
-// Tasks
+// TASKS
 // =================================================================
 
 void vGateStateTask(void *pvParameters)
 {
-    if (ENABLE_WATCHDOG)
+    if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
     CommandMessage msg;
     while (1)
     {
-        if (ENABLE_WATCHDOG)
+        last_checkin_gate = millis();
+        if (ENABLE_HW_WATCHDOG)
             esp_task_wdt_reset();
         if (xQueueReceive(xCommandQueue, &msg, pdMS_TO_TICKS(100)) == pdPASS)
         {
@@ -974,7 +981,7 @@ void vGateStateTask(void *pvParameters)
                         rf_learn_start_time = millis();
                         blink_interval = RF_LEARN_BLINK_INTERVAL;
                         maintenanceButton.setLongClickTime(RF_LEARN_SAVE_LONG_PRESS_TIME);
-                        LOG_PRINTLN("--- RF Learning Mode ---");
+                        LOG_PRINTLN("--- RF Learn ---");
                         break;
                     case CMD_MOVE_TO_POSITION:
                         move_to_position(msg.position);
@@ -994,15 +1001,20 @@ void vGateStateTask(void *pvParameters)
 
 void vMotorControlTask(void *pvParameters)
 {
-    if (ENABLE_WATCHDOG)
+    if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
-    const TickType_t xFrequency = pdMS_TO_TICKS(5);
     TickType_t xLastWakeTime = xTaskGetTickCount();
     while (1)
     {
-        if (ENABLE_WATCHDOG)
+        last_checkin_motor = millis();
+        if (ENABLE_HW_WATCHDOG)
             esp_task_wdt_reset();
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        if (simulate_crash_motor)
+            while (1)
+            {
+                vTaskDelay(1);
+            }
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(5));
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(1)) == pdTRUE)
         {
             handle_safety_sensors();
@@ -1018,45 +1030,44 @@ void vMotorControlTask(void *pvParameters)
 
 void vInputTask(void *pvParameters)
 {
-    if (ENABLE_WATCHDOG)
+    if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
-    const TickType_t xFrequency = pdMS_TO_TICKS(10);
     TickType_t xLastWakeTime = xTaskGetTickCount();
-
-    static unsigned long last_wifi_print_sec = 999;
-    static unsigned long last_maint_print_sec = 999;
-    static unsigned long last_combo_print_sec = 999;
-
     static unsigned long wifi_press_start = 0;
     static unsigned long maint_press_start = 0;
     static unsigned long combo_press_start = 0;
     static bool combo_triggered = false;
+    static unsigned long last_print_combo = 0;
 
     while (1)
     {
-        if (ENABLE_WATCHDOG)
+        last_checkin_input = millis();
+        if (ENABLE_HW_WATCHDOG)
             esp_task_wdt_reset();
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        if (simulate_crash_input)
+            while (1)
+            {
+                vTaskDelay(1);
+            }
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
         mainButton.loop();
         maintenanceButton.loop();
         wifiButton.loop();
 
-        bool wifi_pressed = wifiButton.isPressed();
-        bool maint_pressed = maintenanceButton.isPressed();
+        bool w = wifiButton.isPressed();
+        bool m = maintenanceButton.isPressed();
 
-        // Combo Press
-        if (wifi_pressed && maint_pressed)
+        if (w && m)
         {
             if (combo_press_start == 0)
                 combo_press_start = millis();
             unsigned long held = millis() - combo_press_start;
             if (held < COMBO_MODE_HOLD_TIME)
             {
-                unsigned long rem = (COMBO_MODE_HOLD_TIME - held) / 1000;
-                if (rem != last_combo_print_sec)
+                if (millis() - last_print_combo > 1000)
                 {
-                    last_combo_print_sec = rem;
-                    LOG_PRINTF("Enter RF Learn in %lu s...\n", rem + 1);
+                    last_print_combo = millis();
+                    LOG_PRINTF("RF Learn in %lu s...\n", (COMBO_MODE_HOLD_TIME - held) / 1000 + 1);
                 }
             }
             else if (!combo_triggered)
@@ -1072,55 +1083,25 @@ void vInputTask(void *pvParameters)
         {
             combo_press_start = 0;
             combo_triggered = false;
-            last_combo_print_sec = 999;
-
-            // WiFi Button
-            if (wifi_pressed)
+            if (w)
             {
                 if (wifi_press_start == 0)
                     wifi_press_start = millis();
                 unsigned long held = millis() - wifi_press_start;
                 if (held < WIFI_CONFIG_LONG_PRESS_TIME)
-                {
-                    unsigned long rem = (WIFI_CONFIG_LONG_PRESS_TIME - held) / 1000;
-                    if (rem != last_wifi_print_sec)
-                    {
-                        last_wifi_print_sec = rem;
-                        LOG_PRINTF("WiFi Config in %lu s...\n", rem + 1);
-                    }
+                { /* logic if needed */
                 }
             }
             else
-            {
                 wifi_press_start = 0;
-                last_wifi_print_sec = 999;
-            }
-
-            // Maintenance Button
-            if (maint_pressed)
+            if (m)
             {
                 if (maint_press_start == 0)
                     maint_press_start = millis();
-                unsigned long held = millis() - maint_press_start;
-                unsigned long target = (rf_learn_state != RF_LEARN_INACTIVE) ? RF_LEARN_SAVE_LONG_PRESS_TIME : CALIBRATION_LONG_PRESS_TIME;
-                if (held < target)
-                {
-                    unsigned long rem = (target - held) / 1000;
-                    if (rem != last_maint_print_sec)
-                    {
-                        last_maint_print_sec = rem;
-                        if (rf_learn_state != RF_LEARN_INACTIVE)
-                            LOG_PRINTF("Saving RF in %lu s...\n", rem + 1);
-                        else
-                            LOG_PRINTF("Calibration in %lu s...\n", rem + 1);
-                    }
-                }
+                /* logic if needed */
             }
             else
-            {
                 maint_press_start = 0;
-                last_maint_print_sec = 999;
-            }
         }
 
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(1)) == pdTRUE)
@@ -1137,17 +1118,22 @@ void vInputTask(void *pvParameters)
 
 void vNetworkTask(void *pvParameters)
 {
-    if (ENABLE_WATCHDOG)
+    if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
-    const TickType_t xFrequency = pdMS_TO_TICKS(500);
     TickType_t xLastWakeTime = xTaskGetTickCount();
     int logCounter = 0;
 
     while (1)
     {
-        if (ENABLE_WATCHDOG)
+        last_checkin_network = millis();
+        if (ENABLE_HW_WATCHDOG)
             esp_task_wdt_reset();
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        if (simulate_crash_network)
+            while (1)
+            {
+                vTaskDelay(1);
+            }
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
 
         if (WiFi.status() == WL_CONNECTED)
         {
@@ -1179,15 +1165,20 @@ void vNetworkTask(void *pvParameters)
                     delay(500);
                     ESP.restart();
                 }
-                else if (cmd.equalsIgnoreCase("crash")) {
-                    LOG_PRINTLN("Force crashing! Watchdog should reset in 10s...");
-                    delay(100); 
-                    
-                    // Infinite loop that blocks EVERYTHING and never sleeps
-                    while(true) {
-                        // Do NOTHING. Do not delay. Do not reset WDT.
-                        // This starves the CPU and triggers the hardware watchdog.
-                    }
+                else if (cmd.equalsIgnoreCase("crash motor"))
+                {
+                    simulate_crash_motor = true;
+                    LOG_PRINTLN("Simulating MOTOR crash...");
+                }
+                else if (cmd.equalsIgnoreCase("crash network"))
+                {
+                    simulate_crash_network = true;
+                    LOG_PRINTLN("Simulating NETWORK crash...");
+                }
+                else if (cmd.equalsIgnoreCase("crash input"))
+                {
+                    simulate_crash_input = true;
+                    LOG_PRINTLN("Simulating INPUT crash...");
                 }
             }
         }
@@ -1210,18 +1201,14 @@ void vConfigPortalTask(void *pvParameters)
 {
     if (hNetworkTask != NULL)
         vTaskSuspend(hNetworkTask);
-    LOG_PRINTLN("Starting Config Portal...");
+    LOG_PRINTLN("Config Portal Started...");
     wm.setConfigPortalTimeout(180);
     wm.startConfigPortal("GateControllerAP");
-    LOG_PRINTLN("Restarting...");
     delay(1000);
     ESP.restart();
     vTaskDelete(NULL);
 }
 
-// =================================================================
-// Setup
-// =================================================================
 void setup()
 {
     xLogMutex = xSemaphoreCreateMutex();
@@ -1231,32 +1218,25 @@ void setup()
 
     Serial.begin(115200);
     delay(1000);
-    LOG_PRINTLN("\nSliding Gate Controller Starting...");
+    LOG_PRINTLN("\nGate Controller Starting...");
 
-    // Init Preferences for Boot Count
     preferences.begin("gate_stats", false);
     bootCount = preferences.getUInt("boot_count", 0);
     bootCount++;
     preferences.putUInt("boot_count", bootCount);
     preferences.end();
 
-    if (ENABLE_WATCHDOG)
+    if (ENABLE_HW_WATCHDOG)
     {
         esp_task_wdt_deinit();
-        esp_task_wdt_config_t twdt_config = {
-            .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
-            .idle_core_mask = (1 << 0),
-            .trigger_panic = true};
+        esp_task_wdt_config_t twdt_config = {.timeout_ms = HW_WDT_TIMEOUT * 1000, .idle_core_mask = (1 << 0), .trigger_panic = true};
         esp_task_wdt_init(&twdt_config);
         esp_task_wdt_add(NULL);
-        LOG_PRINTLN("Watchdog Enabled (10s).");
     }
 
     if (!LittleFS.begin(true))
         LOG_PRINTLN("LittleFS Failed!");
-
     check_reset_reason();
-    dump_system_log();
     load_params();
 
 #if MOTOR_CONTROL_MODE == 1
@@ -1320,17 +1300,24 @@ void setup()
     mqtt.begin(mqtt_server, port, mqtt_user, mqtt_password);
     telnetServer.begin();
 
+    // Init checkin times
+    last_checkin_motor = millis();
+    last_checkin_network = millis();
+    last_checkin_input = millis();
+    last_checkin_gate = millis();
+
+    xTaskCreate(vSupervisorTask, "Supervisor", 3072, NULL, 5, NULL); // Highest Priority
     xTaskCreate(vMotorControlTask, "MotorControl", 4096, NULL, 4, NULL);
     xTaskCreate(vInputTask, "InputReader", 3072, NULL, 3, NULL);
     xTaskCreate(vGateStateTask, "GateStateManager", 4096, NULL, 2, NULL);
     xTaskCreate(vNetworkTask, "NetworkManager", 4096, NULL, 1, &hNetworkTask);
 
-    LOG_PRINTLN("Scheduler Started.");
+    LOG_PRINTLN("Setup Complete. Scheduler Running.");
 }
 
 void loop()
 {
-    if (ENABLE_WATCHDOG)
+    if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_reset();
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
