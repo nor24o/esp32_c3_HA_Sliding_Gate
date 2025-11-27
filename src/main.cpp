@@ -10,6 +10,9 @@
 #include <esp_task_wdt.h>
 #include <Preferences.h>
 
+// [CRITICAL] Disable Serial to prevent Pin 1 (TX) interference with Motor Relay
+#define USE_SERIAL_DEBUG false
+
 // --- CONFIGURATION ---
 #define ENABLE_HW_WATCHDOG true
 #define HW_WDT_TIMEOUT 20      // Hardware WDT (Failsafe)
@@ -30,11 +33,13 @@ volatile unsigned long last_checkin_motor = 0;
 volatile unsigned long last_checkin_network = 0;
 volatile unsigned long last_checkin_input = 0;
 volatile unsigned long last_checkin_gate = 0;
+volatile unsigned long last_checkin_logger = 0; // [NEW]
 
 // Simulation Flags
 bool simulate_crash_motor = false;
 bool simulate_crash_network = false;
 bool simulate_crash_input = false;
+bool simulate_crash_logger = false; // [NEW]
 
 // --- Command Structure ---
 enum GateCommand
@@ -42,7 +47,8 @@ enum GateCommand
     CMD_NONE,
     CMD_OPEN,
     CMD_CLOSE,
-    CMD_STOP_USER,
+    CMD_STOP_ONLY,
+    CMD_TOGGLE,
     CMD_STOP_INTERNAL,
     CMD_REVERSE,
     CMD_CALIBRATE_START,
@@ -229,6 +235,7 @@ void save_params();
 void load_params();
 void check_reset_reason();
 void dump_system_log();
+void dump_config();
 void vConfigPortalTask(void *pvParameters);
 void log_io_status();
 void log_system_error(const char *msg);
@@ -285,6 +292,22 @@ void dump_system_log()
         logFile.close();
     }
     LOG_PRINTLN("\n------------\n");
+}
+// [NEW] Dumps current configuration and RF codes
+void dump_config() {
+    LOG_PRINTLN("\n--- CONFIGURATION ---");
+    LOG_PRINTF("Travel Time: %lu ms\n", gate_travel_time);
+    LOG_PRINTF("MQTT Server: %s\n", mqtt_server);
+    LOG_PRINTF("MQTT Port: %s\n", mqtt_port_str);
+    LOG_PRINTLN("\n--- RF CODES ---");
+    LOG_PRINTF("OPEN:   %lu\n", rf_gate_open_code);
+    LOG_PRINTF("CLOSE:  %lu\n", rf_gate_close_code);
+    LOG_PRINTF("STOP:   %lu\n", rf_gate_stop_code);
+    LOG_PRINTF("POS 50: %lu\n", rf_gate_pos50_code);
+    LOG_PRINTLN("\n--- STATE ---");
+    LOG_PRINTF("Current POS: %.2f\n", current_position);
+    LOG_PRINTF("Target POS: %.2f\n", target_position);
+    LOG_PRINTLN("---------------------\n");
 }
 
 void check_reset_reason()
@@ -367,6 +390,14 @@ void vSupervisorTask(void *pvParameters)
             {
                 LOG_PRINTLN("CRITICAL: Gate Logic Stuck!");
                 log_system_error("CRASH: Gate State Task Hung");
+                delay(500);
+                ESP.restart();
+            }
+            // [NEW] Check Logger Task
+            if (now - last_checkin_logger > SOFT_WDT_TIMEOUT)
+            {
+                LOG_PRINTLN("CRITICAL: Logger Task Stuck!");
+                log_system_error("CRASH: Logger Task Hung");
                 delay(500);
                 ESP.restart();
             }
@@ -456,7 +487,7 @@ void log_io_status()
 // =================================================================
 // Button & HA Callbacks
 // =================================================================
-void main_button_short_press(Button2 &btn) { send_command(CMD_STOP_USER); }
+void main_button_short_press(Button2 &btn) { send_command(CMD_TOGGLE); }
 void main_button_long_press(Button2 &btn) { send_command(CMD_REVERSE); }
 void maintenance_button_short_press(Button2 &btn) { send_command(CMD_RF_LEARN_SKIP); }
 void maintenance_button_long_press(Button2 &btn)
@@ -487,13 +518,13 @@ void onCoverCommand(HACover::CoverCommand cmd, HACover *sender)
         send_command(CMD_CLOSE);
         break;
     case HACover::CommandStop:
-        send_command(CMD_STOP_USER);
+        send_command(CMD_STOP_ONLY);
         break;
     }
 }
 void onOpenCommand(HAButton *sender) { send_command(CMD_OPEN); }
 void onCloseCommand(HAButton *sender) { send_command(CMD_CLOSE); }
-void onStopCommand(HAButton *sender) { send_command(CMD_STOP_USER); }
+void onStopCommand(HAButton *sender) { send_command(CMD_STOP_ONLY); }
 void onCalibrateCommand(HAButton *sender) { send_command(CMD_CALIBRATE_START); }
 void onMoveTo50Command(HAButton *sender) { send_command(CMD_MOVE_TO_POSITION, 0.5f); }
 
@@ -639,7 +670,7 @@ void handle_rf_signal()
     else if (code == rf_gate_close_code)
         send_command(CMD_CLOSE);
     else if (code == rf_gate_stop_code)
-        send_command(CMD_STOP_USER);
+        send_command(CMD_STOP_ONLY);
     else if (code == rf_gate_pos50_code)
         send_command(CMD_MOVE_TO_POSITION, 0.5f);
 }
@@ -768,8 +799,6 @@ void start_closing()
     execute_close_sequence();
 }
 
-// --- MISSING FUNCTIONS RESTORED ---
-
 void start_calibration()
 {
     if (current_operation != IDLE || cal_state != CAL_INACTIVE || rf_learn_state != RF_LEARN_INACTIVE)
@@ -814,8 +843,6 @@ void handle_calibration()
         break;
     }
 }
-
-// ------------------------------------
 
 void stop_movement(bool triggered_by_user)
 {
@@ -918,6 +945,38 @@ void handle_safety_sensors()
 // TASKS
 // =================================================================
 
+// [NEW] DEDICATED LOGGER TASK
+void vLoggerTask(void *pvParameters)
+{
+    if (ENABLE_HW_WATCHDOG)
+        esp_task_wdt_add(NULL);
+    // 5-second interval
+    const TickType_t xFrequency = pdMS_TO_TICKS(1000);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    while (1)
+    {
+        last_checkin_logger = millis();
+        if (ENABLE_HW_WATCHDOG)
+            esp_task_wdt_reset();
+
+        // Simulation for testing watchdog
+        if (simulate_crash_logger)
+            while (1)
+            {
+                vTaskDelay(1);
+            }
+
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+        if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            log_io_status();
+            xSemaphoreGive(xStateMutex);
+        }
+    }
+}
+
 void vGateStateTask(void *pvParameters)
 {
     if (ENABLE_HW_WATCHDOG)
@@ -952,7 +1011,11 @@ void vGateStateTask(void *pvParameters)
                     case CMD_CLOSE:
                         start_closing();
                         break;
-                    case CMD_STOP_USER:
+                    case CMD_STOP_ONLY:
+                        if (current_operation != IDLE)
+                            stop_movement(true);
+                        break;
+                    case CMD_TOGGLE:
                         if (current_operation != IDLE)
                             stop_movement(true);
                         else if (last_operation_before_stop != IDLE)
@@ -1121,7 +1184,9 @@ void vNetworkTask(void *pvParameters)
     if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    int logCounter = 0;
+
+    // [CHANGE] We no longer log from here. Only MQTT publish.
+    int mqttCounter = 0;
 
     while (1)
     {
@@ -1152,8 +1217,11 @@ void vNetworkTask(void *pvParameters)
             {
                 String cmd = telnetClient.readStringUntil('\n');
                 cmd.trim();
+                
                 if (cmd.equalsIgnoreCase("logs"))
                     dump_system_log();
+                else if (cmd.equalsIgnoreCase("conf")) dump_config(); // [NEW]
+
                 else if (cmd.equalsIgnoreCase("clear_logs"))
                 {
                     LittleFS.remove(LOG_FILE);
@@ -1180,16 +1248,22 @@ void vNetworkTask(void *pvParameters)
                     simulate_crash_input = true;
                     LOG_PRINTLN("Simulating INPUT crash...");
                 }
+                else if (cmd.equalsIgnoreCase("crash logger"))
+                {
+                    simulate_crash_logger = true;
+                    LOG_PRINTLN("Simulating LOGGER crash...");
+                }
             }
         }
         handle_wifi_status();
-        logCounter++;
-        if (logCounter >= 10)
-        {
-            logCounter = 0;
+
+        mqttCounter++;
+        if (mqttCounter >= 10)
+        { // Every 5 seconds
+            mqttCounter = 0;
+            // Only publish MQTT states here. Logging moved to vLoggerTask.
             if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(10)) == pdTRUE)
             {
-                log_io_status();
                 publish_all_states();
                 xSemaphoreGive(xStateMutex);
             }
@@ -1216,7 +1290,10 @@ void setup()
     xMotorRelayMutex = xSemaphoreCreateMutex();
     xCommandQueue = xQueueCreate(10, sizeof(CommandMessage));
 
+// [CRITICAL] Disable Serial if using Pin 1 for Motor
+#if USE_SERIAL_DEBUG
     Serial.begin(115200);
+#endif
     delay(1000);
     LOG_PRINTLN("\nGate Controller Starting...");
 
@@ -1300,13 +1377,14 @@ void setup()
     mqtt.begin(mqtt_server, port, mqtt_user, mqtt_password);
     telnetServer.begin();
 
-    // Init checkin times
     last_checkin_motor = millis();
     last_checkin_network = millis();
     last_checkin_input = millis();
     last_checkin_gate = millis();
+    last_checkin_logger = millis();
 
-    xTaskCreate(vSupervisorTask, "Supervisor", 3072, NULL, 5, NULL); // Highest Priority
+    xTaskCreate(vSupervisorTask, "Supervisor", 3072, NULL, 5, NULL);
+    xTaskCreate(vLoggerTask, "Logger", 4096, NULL, 1, NULL); // [NEW] Added dedicated Logger Task
     xTaskCreate(vMotorControlTask, "MotorControl", 4096, NULL, 4, NULL);
     xTaskCreate(vInputTask, "InputReader", 3072, NULL, 3, NULL);
     xTaskCreate(vGateStateTask, "GateStateManager", 4096, NULL, 2, NULL);
