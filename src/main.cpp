@@ -9,18 +9,23 @@
 #include <ArduinoJson.h>
 #include <esp_task_wdt.h>
 #include <Preferences.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <WebSocketsServer.h> // [NEW] Required Library: links2004/WebSockets
 
-// [CRITICAL] Disable Serial to prevent Pin 1 (TX) interference with Motor Relay
+// [CRITICAL] Disable Serial to prevent Pin 1 (TX) interference
 #define USE_SERIAL_DEBUG false
 
 // --- CONFIGURATION ---
 #define ENABLE_HW_WATCHDOG true
-#define HW_WDT_TIMEOUT 20      // Hardware WDT (Failsafe)
-#define SOFT_WDT_TIMEOUT 10000 // Software Monitor Timeout
+#define HW_WDT_TIMEOUT 30      // 30s Hardware WDT
+#define SOFT_WDT_TIMEOUT 20000 // 20s Software Monitor Timeout
 #define MAX_LOG_SIZE 5000
 
 SemaphoreHandle_t xLogMutex = NULL;
 WiFiClient telnetClient;
+WebServer server(80);           // Dedicated Web Server for Config/HTML
+WebSocketsServer webSocket(81); // [NEW] WebSocket Server for Real-time Control
 
 #include "SerialMirror.hpp"
 #include <freertos/FreeRTOS.h>
@@ -31,15 +36,23 @@ WiFiClient telnetClient;
 // --- WATCHDOG TRACKERS ---
 volatile unsigned long last_checkin_motor = 0;
 volatile unsigned long last_checkin_network = 0;
-volatile unsigned long last_checkin_input = 0;
 volatile unsigned long last_checkin_gate = 0;
-volatile unsigned long last_checkin_logger = 0; // [NEW]
+volatile unsigned long last_checkin_logger = 0;
+volatile unsigned long last_checkin_rf = 0;
+volatile unsigned long last_checkin_button = 0;
+volatile unsigned long last_checkin_led = 0;
+
+// Flags
+volatile bool wifi_config_request = false;
+bool web_server_started = false;
 
 // Simulation Flags
 bool simulate_crash_motor = false;
 bool simulate_crash_network = false;
-bool simulate_crash_input = false;
-bool simulate_crash_logger = false; // [NEW]
+bool simulate_crash_rf = false;
+bool simulate_crash_gate = false;
+bool simulate_crash_button = false;
+bool simulate_crash_logger = false;
 
 // --- Command Structure ---
 enum GateCommand
@@ -70,7 +83,8 @@ SemaphoreHandle_t xStateMutex;
 SemaphoreHandle_t xMotorRelayMutex;
 TaskHandle_t hNetworkTask = NULL;
 
-Preferences preferences;
+Preferences preferences; // Used for Boot Count
+Preferences gatePrefs;   // Used for Config
 unsigned int bootCount = 0;
 
 // =================================================================
@@ -104,27 +118,23 @@ const unsigned long RF_LEARN_TIMEOUT = 30000;
 const unsigned long RF_LEARN_SAVE_LONG_PRESS_TIME = 1500;
 const unsigned long RF_DEBOUNCE_DELAY = 400;
 const unsigned long COMBO_MODE_HOLD_TIME = 2000;
+const unsigned long CALIBRATION_SAFETY_TIMEOUT = 90000;
 
 unsigned long gate_travel_time = 30000;
 char mqtt_server[40] = "192.168.1.12";
 char mqtt_port_str[6] = "1883";
 char mqtt_user[32] = "admin";
 char mqtt_password[64] = "admin";
+
 unsigned long rf_gate_open_code = 1234567;
 unsigned long rf_gate_close_code = 7654321;
 unsigned long rf_gate_stop_code = 1111111;
 unsigned long rf_gate_pos50_code = 2222222;
 
-WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, sizeof(mqtt_server));
-WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", mqtt_port_str, sizeof(mqtt_port_str));
-WiFiManagerParameter custom_mqtt_user("user", "MQTT User", mqtt_user, sizeof(mqtt_user));
-WiFiManagerParameter custom_mqtt_password("password", "MQTT Password", mqtt_password, sizeof(mqtt_password));
-
 unsigned long last_blink_time = 0;
 unsigned long blink_interval = 0;
 bool indicator_light_state = false;
 
-#define PARAMS_FILE "/gate_params_data.txt"
 #define LOG_FILE "/system_log.txt"
 #define BLINK_INTERVAL_OPENING 1000
 #define BLINK_INTERVAL_CLOSING 500
@@ -140,8 +150,9 @@ enum CoverOperation
 enum CalibrationState
 {
     CAL_INACTIVE,
-    CAL_CLOSING_TO_START,
-    CAL_OPENING_FOR_TIMING,
+    CAL_HOMING_CLOSE,
+    CAL_MEASURING_OPEN,
+    CAL_VERIFYING_CLOSE,
     CAL_DONE
 };
 enum RFLearningState
@@ -172,6 +183,7 @@ CalibrationState cal_state = CAL_INACTIVE;
 CoverOperation last_operation_before_stop = IDLE;
 RFLearningState rf_learn_state = RF_LEARN_INACTIVE;
 unsigned long rf_learn_start_time = 0;
+unsigned long calibration_start_time = 0;
 
 #if MOTOR_CONTROL_MODE == 1
 MotorRelayState motor_relay_state = R_OFF;
@@ -197,6 +209,7 @@ RCSwitch mySwitch;
 Button2 mainButton;
 Button2 maintenanceButton;
 Button2 wifiButton;
+
 WiFiManager wm;
 WiFiServer telnetServer(23);
 
@@ -236,9 +249,11 @@ void load_params();
 void check_reset_reason();
 void dump_system_log();
 void dump_config();
-void vConfigPortalTask(void *pvParameters);
 void log_io_status();
 void log_system_error(const char *msg);
+void send_command(GateCommand cmd, float pos = -1.0f);
+void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length);
+void broadcastStatus();
 
 // =================================================================
 // LOGGING & WATCHDOG
@@ -260,7 +275,6 @@ void log_system_error(const char *msg)
         else
             f.close();
     }
-
     File logFile = LittleFS.open(LOG_FILE, "a");
     if (logFile)
     {
@@ -293,20 +307,17 @@ void dump_system_log()
     }
     LOG_PRINTLN("\n------------\n");
 }
-// [NEW] Dumps current configuration and RF codes
-void dump_config() {
+
+void dump_config()
+{
     LOG_PRINTLN("\n--- CONFIGURATION ---");
     LOG_PRINTF("Travel Time: %lu ms\n", gate_travel_time);
     LOG_PRINTF("MQTT Server: %s\n", mqtt_server);
-    LOG_PRINTF("MQTT Port: %s\n", mqtt_port_str);
     LOG_PRINTLN("\n--- RF CODES ---");
-    LOG_PRINTF("OPEN:   %lu\n", rf_gate_open_code);
-    LOG_PRINTF("CLOSE:  %lu\n", rf_gate_close_code);
-    LOG_PRINTF("STOP:   %lu\n", rf_gate_stop_code);
-    LOG_PRINTF("POS 50: %lu\n", rf_gate_pos50_code);
+    LOG_PRINTF("OPEN: %lu | CLOSE: %lu | STOP: %lu\n", rf_gate_open_code, rf_gate_close_code, rf_gate_stop_code);
+    LOG_PRINTF("POS50: %lu\n", rf_gate_pos50_code);
     LOG_PRINTLN("\n--- STATE ---");
     LOG_PRINTF("Current POS: %.2f\n", current_position);
-    LOG_PRINTF("Target POS: %.2f\n", target_position);
     LOG_PRINTLN("---------------------\n");
 }
 
@@ -315,7 +326,6 @@ void check_reset_reason()
     esp_reset_reason_t reason = esp_reset_reason();
     const char *reason_str = "Unknown";
     bool save_log = false;
-
     switch (reason)
     {
     case ESP_RST_POWERON:
@@ -348,56 +358,34 @@ void check_reset_reason()
         log_system_error(reason_str);
 }
 
-// --- SUPERVISOR TASK (Software Watchdog) ---
 void vSupervisorTask(void *pvParameters)
 {
     if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
-
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (ENABLE_HW_WATCHDOG)
             esp_task_wdt_reset();
-
         unsigned long now = millis();
 
-        // Check if tasks are alive (only check if system has been up for > 15s to allow init)
-        if (millis() > 15000)
+        if (millis() > 25000)
         {
-            if (now - last_checkin_network > SOFT_WDT_TIMEOUT)
+            if (!wifi_config_request && (now - last_checkin_network > SOFT_WDT_TIMEOUT))
             {
-                LOG_PRINTLN("CRITICAL: Network Task Stuck!");
                 log_system_error("CRASH: Network Task Hung");
                 delay(500);
                 ESP.restart();
             }
             if (now - last_checkin_motor > SOFT_WDT_TIMEOUT)
             {
-                LOG_PRINTLN("CRITICAL: Motor Task Stuck!");
-                log_system_error("CRASH: Motor/Safety Task Hung");
-                delay(500);
-                ESP.restart();
-            }
-            if (now - last_checkin_input > SOFT_WDT_TIMEOUT)
-            {
-                LOG_PRINTLN("CRITICAL: Input Task Stuck!");
-                log_system_error("CRASH: Input/RF Task Hung");
+                log_system_error("CRASH: Motor Task Hung");
                 delay(500);
                 ESP.restart();
             }
             if (now - last_checkin_gate > SOFT_WDT_TIMEOUT)
             {
-                LOG_PRINTLN("CRITICAL: Gate Logic Stuck!");
-                log_system_error("CRASH: Gate State Task Hung");
-                delay(500);
-                ESP.restart();
-            }
-            // [NEW] Check Logger Task
-            if (now - last_checkin_logger > SOFT_WDT_TIMEOUT)
-            {
-                LOG_PRINTLN("CRITICAL: Logger Task Stuck!");
-                log_system_error("CRASH: Logger Task Hung");
+                log_system_error("CRASH: Gate Logic Hung");
                 delay(500);
                 ESP.restart();
             }
@@ -406,70 +394,69 @@ void vSupervisorTask(void *pvParameters)
 }
 
 // =================================================================
-// Parameters & IO
+// Parameters & IO (USING PREFERENCES)
 // =================================================================
+
 void save_params()
 {
-    JsonDocument doc;
-    doc["gate_travel_time"] = gate_travel_time;
-    doc["mqtt_server"] = mqtt_server;
-    doc["mqtt_port"] = mqtt_port_str;
-    doc["mqtt_user"] = mqtt_user;
-    doc["mqtt_password"] = mqtt_password;
-    doc["rf_gate_open_code"] = rf_gate_open_code;
-    doc["rf_gate_close_code"] = rf_gate_close_code;
-    doc["rf_gate_stop_code"] = rf_gate_stop_code;
-    doc["rf_gate_pos50_code"] = rf_gate_pos50_code;
-    File f = LittleFS.open(PARAMS_FILE, "w");
-    if (f)
-    {
-        serializeJson(doc, f);
-        f.close();
-        LOG_PRINTLN("Config saved.");
-    }
+    LOG_PRINTLN("SAVING TO PREFERENCES...");
+    gatePrefs.begin("gate_conf", false); // false = read/write
+
+    gatePrefs.putULong("travel_time", gate_travel_time);
+    gatePrefs.putString("mqtt_server", mqtt_server);
+    gatePrefs.putString("mqtt_port", mqtt_port_str);
+    gatePrefs.putString("mqtt_user", mqtt_user);
+    gatePrefs.putString("mqtt_pass", mqtt_password);
+
+    gatePrefs.putULong("rf_open", rf_gate_open_code);
+    gatePrefs.putULong("rf_close", rf_gate_close_code);
+    gatePrefs.putULong("rf_stop", rf_gate_stop_code);
+    gatePrefs.putULong("rf_pos50", rf_gate_pos50_code);
+
+    gatePrefs.end();
+    LOG_PRINTLN("DONE.");
 }
 
 void load_params()
 {
-    if (LittleFS.exists(PARAMS_FILE))
-    {
-        File f = LittleFS.open(PARAMS_FILE, "r");
-        if (f)
-        {
-            JsonDocument doc;
-            deserializeJson(doc, f);
-            gate_travel_time = doc["gate_travel_time"] | gate_travel_time;
-            strncpy(mqtt_server, doc["mqtt_server"] | mqtt_server, sizeof(mqtt_server));
-            strncpy(mqtt_port_str, doc["mqtt_port"] | mqtt_port_str, sizeof(mqtt_port_str));
-            strncpy(mqtt_user, doc["mqtt_user"] | mqtt_user, sizeof(mqtt_user));
-            strncpy(mqtt_password, doc["mqtt_password"] | mqtt_password, sizeof(mqtt_password));
-            rf_gate_open_code = doc["rf_gate_open_code"] | rf_gate_open_code;
-            rf_gate_close_code = doc["rf_gate_close_code"] | rf_gate_close_code;
-            rf_gate_stop_code = doc["rf_gate_stop_code"] | rf_gate_stop_code;
-            rf_gate_pos50_code = doc["rf_gate_pos50_code"] | rf_gate_pos50_code;
-            f.close();
-        }
-    }
-    else
-        save_params();
+    LOG_PRINTLN("LOADING FROM PREFERENCES...");
+    gatePrefs.begin("gate_conf", true); // true = read-only
+
+    gate_travel_time = gatePrefs.getULong("travel_time", 30000);
+
+    String s = gatePrefs.getString("mqtt_server", "192.168.1.12");
+    s.toCharArray(mqtt_server, 40);
+
+    s = gatePrefs.getString("mqtt_port", "1883");
+    s.toCharArray(mqtt_port_str, 6);
+
+    s = gatePrefs.getString("mqtt_user", "admin");
+    s.toCharArray(mqtt_user, 32);
+
+    s = gatePrefs.getString("mqtt_pass", "admin");
+    s.toCharArray(mqtt_password, 64);
+
+    rf_gate_open_code = gatePrefs.getULong("rf_open", 1234567);
+    rf_gate_close_code = gatePrefs.getULong("rf_close", 7654321);
+    rf_gate_stop_code = gatePrefs.getULong("rf_stop", 1111111);
+    rf_gate_pos50_code = gatePrefs.getULong("rf_pos50", 2222222);
+
+    gatePrefs.end();
+    LOG_PRINTF("Loaded MQTT IP: %s\n", mqtt_server);
 }
 
-void send_command(GateCommand cmd, float pos = -1.0f)
+void send_command(GateCommand cmd, float pos)
 {
     CommandMessage msg = {cmd, pos};
-    xQueueSend(xCommandQueue, &msg, 0);
+    // [FIX] Wait for Queue to be available (100ms) to prevent dropped clicks
+    xQueueSend(xCommandQueue, &msg, pdMS_TO_TICKS(100));
 }
 
 void log_io_status()
 {
     char buf[128];
-    int lim_open = digitalRead(LIMIT_OPEN_PIN);
-    int lim_close = digitalRead(LIMIT_CLOSE_PIN);
-    int photo = digitalRead(PHOTO_BARRIER_PIN);
-    int light = digitalRead(RELAY_INDICATOR_LIGHT_PIN);
     int mot1 = 0;
     int mot2 = 0;
-
 #if MOTOR_CONTROL_MODE == 1
     mot1 = digitalRead(RELAY_MOTOR_DIRECTION_PIN);
     mot2 = digitalRead(RELAY_MOTOR_ENABLE_PIN);
@@ -477,11 +464,165 @@ void log_io_status()
     mot1 = digitalRead(RELAY_MOTOR_OPEN_PIN);
     mot2 = digitalRead(RELAY_MOTOR_CLOSE_PIN);
 #endif
-
-    snprintf(buf, sizeof(buf),
-             "[IO] OP:%d CL:%d PH:%d | M1:%d M2:%d LGT:%d | POS:%.2f",
-             lim_open, lim_close, photo, mot1, mot2, light, current_position);
+    snprintf(buf, sizeof(buf), "[IO] OP:%d CL:%d PH:%d | M1:%d M2:%d LGT:%d | POS:%.2f",
+             digitalRead(LIMIT_OPEN_PIN), digitalRead(LIMIT_CLOSE_PIN), digitalRead(PHOTO_BARRIER_PIN),
+             mot1, mot2, digitalRead(RELAY_INDICATOR_LIGHT_PIN), current_position);
     LOG_PRINTLN(buf);
+}
+
+// =================================================================
+// WEB SERVER HANDLERS (WebSocket Enhanced)
+// =================================================================
+
+// [NEW] WebSocket Event Handler
+void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
+{
+    switch (type)
+    {
+    case WStype_DISCONNECTED:
+        // LOG_PRINTF("[%u] Disconnected!\n", num);
+        break;
+    case WStype_CONNECTED:
+        // LOG_PRINTF("[%u] Connected!\n", num);
+        // Send immediate status on connect
+        broadcastStatus();
+        break;
+    case WStype_TEXT:
+        // Simple command parser
+        String text = String((char *)payload);
+        if (text == "OPEN")
+            send_command(CMD_OPEN);
+        else if (text == "CLOSE")
+            send_command(CMD_CLOSE);
+        else if (text == "STOP")
+            send_command(CMD_STOP_ONLY);
+        break;
+    }
+}
+
+// [NEW] Broadcast Status to all connected WebSocket clients
+void broadcastStatus()
+{
+    if (webSocket.connectedClients() > 0)
+    {
+        char json[128];
+        String status = "STOPPED";
+        if (current_operation == OPENING)
+            status = "OPENING";
+        else if (current_operation == CLOSING)
+            status = "CLOSING";
+
+        // Simple JSON formatting (faster than ArduinoJson for this task)
+        snprintf(json, sizeof(json), "{\"s\":\"%s\",\"p\":%d}", status.c_str(), (int)(current_position * 100));
+        webSocket.broadcastTXT(json);
+    }
+}
+
+void handleRoot()
+{
+    // [UPDATED] HTML with JavaScript WebSocket Client
+    String html = "<!DOCTYPE html><html><head><title>Gate</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+    html += "body{font-family:sans-serif;margin:20px;text-align:center;background-color:#f4f4f4}";
+    html += ".card{background:white;padding:20px;border-radius:10px;box-shadow:0 2px 5px rgba(0,0,0,0.1);max-width:400px;margin:auto}";
+    html += ".btn{display:inline-block;padding:15px 30px;color:white;text-decoration:none;border-radius:5px;margin:5px;font-weight:bold;cursor:pointer;border:none;font-size:16px;width:80%}";
+    html += ".grn{background:#28a745}.red{background:#dc3545}.gry{background:#6c757d}.blu{background:#007bff}";
+    html += "p{font-size:18px;}";
+    html += "</style></head><body><div class='card'>";
+
+    html += "<h1>Gate Control</h1>";
+    html += "<p>Status: <b id='status'>...</b></p>";
+    html += "<p>Position: <b id='pos'>...</b>%</p>";
+
+    // Buttons call JS function send() instead of links
+    html += "<button onclick=\"send('OPEN')\" class='btn grn'>OPEN</button><br>";
+    html += "<button onclick=\"send('STOP')\" class='btn gry'>STOP</button><br>";
+    html += "<button onclick=\"send('CLOSE')\" class='btn red'>CLOSE</button><br><br>";
+    html += "<hr><a href='/config' style='color:#333;text-decoration:underline;'>Settings</a>";
+
+    // JavaScript for WebSocket
+    html += "<script>";
+    html += "var ws = new WebSocket('ws://' + location.hostname + ':81/');";
+    html += "ws.onmessage = function(event) {";
+    html += "  var d = JSON.parse(event.data);";
+    html += "  document.getElementById('status').innerHTML = d.s;";
+    html += "  document.getElementById('pos').innerHTML = d.p;";
+    html += "};";
+    html += "function send(cmd) { ws.send(cmd); }";
+    html += "</script>";
+
+    html += "</div></body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleConfigPage()
+{
+    String html = "<!DOCTYPE html><html><head><title>Config</title><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+    html += "body{font-family:sans-serif;margin:20px;background-color:#f4f4f4}";
+    html += ".card{background:white;padding:20px;border-radius:10px;box-shadow:0 2px 5px rgba(0,0,0,0.1);max-width:400px;margin:auto}";
+    html += "input{width:100%;padding:10px;margin:8px 0;box-sizing:border-box;border:1px solid #ccc;border-radius:4px}";
+    html += "input[type=submit]{background-color:#007bff;color:white;cursor:pointer;padding:12px;border:none;border-radius:4px;width:100%}";
+    html += "</style></head><body><div class='card'>";
+    html += "<h2>Configuration</h2><form action='/save' method='POST'>";
+
+    html += "<label>MQTT IP:</label><input type='text' name='mq_ip' value='" + String(mqtt_server) + "'>";
+    html += "<label>MQTT Port:</label><input type='text' name='mq_pt' value='" + String(mqtt_port_str) + "'>";
+    html += "<label>MQTT User:</label><input type='text' name='mq_us' value='" + String(mqtt_user) + "'>";
+    html += "<label>MQTT Pass:</label><input type='password' name='mq_pw' value='" + String(mqtt_password) + "'>";
+    html += "<label>Travel Time (ms):</label><input type='number' name='tt' value='" + String(gate_travel_time) + "'>";
+
+    html += "<input type='submit' value='SAVE & REBOOT'>";
+    html += "</form><br><center><a href='/'>Back to Controls</a></center></div></body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleSavePage()
+{
+    if (server.hasArg("mq_ip"))
+    {
+        String ip = server.arg("mq_ip");
+        ip.trim();
+        strncpy(mqtt_server, ip.c_str(), 40);
+    }
+    if (server.hasArg("mq_pt"))
+    {
+        strncpy(mqtt_port_str, server.arg("mq_pt").c_str(), 6);
+    }
+    if (server.hasArg("mq_us"))
+    {
+        strncpy(mqtt_user, server.arg("mq_us").c_str(), 32);
+    }
+    if (server.hasArg("mq_pw"))
+    {
+        strncpy(mqtt_password, server.arg("mq_pw").c_str(), 64);
+    }
+    if (server.hasArg("tt"))
+    {
+        gate_travel_time = server.arg("tt").toInt();
+    }
+
+    save_params();
+
+    String html = "<html><head><meta http-equiv='refresh' content='5;url=/'></head><body>";
+    html += "<h1>Settings Saved!</h1><p>Device is rebooting...</p></body></html>";
+    server.send(200, "text/html", html);
+
+    delay(500);
+    ESP.restart();
+}
+
+void handleWebCommand()
+{
+    // Only kept for backwards compatibility or direct URL access
+    String path = server.uri();
+    if (path == "/open")
+        send_command(CMD_OPEN);
+    else if (path == "/close")
+        send_command(CMD_CLOSE);
+    else if (path == "/stop")
+        send_command(CMD_STOP_ONLY);
+
+    server.sendHeader("Location", "/");
+    server.send(303);
 }
 
 // =================================================================
@@ -661,6 +802,7 @@ void handle_rf_signal()
     mySwitch.resetAvailable();
     if (code == 0 || is_repeat)
         return;
+
     char code_str[20];
     sprintf(code_str, "%lu", last_rf_code_received);
     rfCodeSensor.setValue(code_str);
@@ -804,41 +946,70 @@ void start_calibration()
     if (current_operation != IDLE || cal_state != CAL_INACTIVE || rf_learn_state != RF_LEARN_INACTIVE)
         return;
     LOG_PRINTLN("--- Starting Calibration ---");
-    cal_state = CAL_CLOSING_TO_START;
+    cal_state = CAL_HOMING_CLOSE;
     blink_interval = CALIBRATION_BLINK_INTERVAL;
+    calibration_start_time = millis();
 }
 
 void handle_calibration()
 {
+    if (millis() - calibration_start_time > CALIBRATION_SAFETY_TIMEOUT)
+    {
+        LOG_PRINTLN("CAL: FAILED (Timeout)");
+        stop_movement(false);
+        cal_state = CAL_INACTIVE;
+        blink_interval = 0;
+        return;
+    }
+
     switch (cal_state)
     {
-    case CAL_CLOSING_TO_START:
+    case CAL_HOMING_CLOSE:
         if (digitalRead(LIMIT_CLOSE_PIN) == LOW)
         {
-            cal_state = CAL_OPENING_FOR_TIMING;
+            LOG_PRINTLN("CAL: Homing Done. Opening...");
+            stop_movement(false);
+            delay(500);
+            cal_state = CAL_MEASURING_OPEN;
             movement_start_time = millis();
             execute_open_sequence();
         }
-        else
+        else if (current_operation != CLOSING)
         {
             execute_close_sequence();
         }
         break;
-    case CAL_OPENING_FOR_TIMING:
+
+    case CAL_MEASURING_OPEN:
         if (digitalRead(LIMIT_OPEN_PIN) == LOW)
         {
-            stop_movement(false);
             gate_travel_time = millis() - movement_start_time;
-            LOG_PRINTF("Calibration Done. Time: %lu ms\n", gate_travel_time);
+            LOG_PRINTF("CAL: Measured Time: %lu ms\n", gate_travel_time);
+            stop_movement(false);
+            delay(500);
+            cal_state = CAL_VERIFYING_CLOSE;
+            LOG_PRINTLN("CAL: Verifying Close...");
+            execute_close_sequence();
+        }
+        break;
+
+    case CAL_VERIFYING_CLOSE:
+        if (digitalRead(LIMIT_CLOSE_PIN) == LOW)
+        {
+            stop_movement(false);
+            LOG_PRINTLN("CAL: Calibration Complete & Saved.");
             save_params();
             cal_state = CAL_DONE;
         }
         break;
+
     case CAL_DONE:
         cal_state = CAL_INACTIVE;
         blink_interval = 0;
+        current_position = 0.0f;
         publish_all_states();
         break;
+
     default:
         break;
     }
@@ -895,6 +1066,9 @@ void update_gate_position()
     if (motor_change_state != M_IDLE)
         return;
 #endif
+    if (cal_state != CAL_INACTIVE)
+        return;
+
     unsigned long elapsed = millis() - movement_start_time;
     float ratio = (gate_travel_time > 0) ? (float(elapsed) / float(gate_travel_time)) : 1.0f;
     if (current_operation == OPENING)
@@ -904,8 +1078,7 @@ void update_gate_position()
     current_position = constrain(current_position, 0.0f, 1.0f);
     if (target_position >= 0.0)
     {
-        if ((current_operation == OPENING && current_position >= target_position) ||
-            (current_operation == CLOSING && current_position <= target_position))
+        if ((current_operation == OPENING && current_position >= target_position) || (current_operation == CLOSING && current_position <= target_position))
         {
             stop_movement(false);
             current_position = target_position;
@@ -922,6 +1095,8 @@ void update_gate_position()
 
 void handle_safety_sensors()
 {
+    if (cal_state != CAL_INACTIVE)
+        return;
     if (current_operation == OPENING && digitalRead(LIMIT_OPEN_PIN) == LOW)
     {
         stop_movement(false);
@@ -942,33 +1117,44 @@ void handle_safety_sensors()
 }
 
 // =================================================================
-// TASKS
+// DEDICATED TASKS
 // =================================================================
 
-// [NEW] DEDICATED LOGGER TASK
+void vLedTask(void *pvParameters)
+{
+    if (ENABLE_HW_WATCHDOG)
+        esp_task_wdt_add(NULL);
+    const TickType_t xFrequency = pdMS_TO_TICKS(100);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    while (1)
+    {
+        last_checkin_led = millis();
+        if (ENABLE_HW_WATCHDOG)
+            esp_task_wdt_reset();
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(20)) == pdTRUE)
+        {
+            handle_indicator_light();
+            xSemaphoreGive(xStateMutex);
+        }
+    }
+}
+
 void vLoggerTask(void *pvParameters)
 {
     if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
-    // 5-second interval
-    const TickType_t xFrequency = pdMS_TO_TICKS(1000);
+    const TickType_t xFrequency = pdMS_TO_TICKS(5000);
     TickType_t xLastWakeTime = xTaskGetTickCount();
-
     while (1)
     {
         last_checkin_logger = millis();
         if (ENABLE_HW_WATCHDOG)
             esp_task_wdt_reset();
-
-        // Simulation for testing watchdog
         if (simulate_crash_logger)
             while (1)
-            {
                 vTaskDelay(1);
-            }
-
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
-
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(100)) == pdTRUE)
         {
             log_io_status();
@@ -977,7 +1163,7 @@ void vLoggerTask(void *pvParameters)
     }
 }
 
-void vGateStateTask(void *pvParameters)
+void vGateLogicTask(void *pvParameters)
 {
     if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
@@ -987,12 +1173,17 @@ void vGateStateTask(void *pvParameters)
         last_checkin_gate = millis();
         if (ENABLE_HW_WATCHDOG)
             esp_task_wdt_reset();
+        if (simulate_crash_gate)
+            while (1)
+                vTaskDelay(1);
         if (xQueueReceive(xCommandQueue, &msg, pdMS_TO_TICKS(100)) == pdPASS)
         {
             if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(10)) == pdTRUE)
             {
                 if (msg.cmd == CMD_WIFI_CONFIG_START)
-                    xTaskCreate(vConfigPortalTask, "ConfigPortal", 6144, NULL, 0, NULL);
+                {
+                    wifi_config_request = true;
+                }
                 else if (msg.cmd == CMD_RF_LEARN_SAVE_EXIT)
                 {
                     LOG_PRINTLN("Saving codes.");
@@ -1062,7 +1253,7 @@ void vGateStateTask(void *pvParameters)
     }
 }
 
-void vMotorControlTask(void *pvParameters)
+void vMotorTask(void *pvParameters)
 {
     if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
@@ -1074,9 +1265,7 @@ void vMotorControlTask(void *pvParameters)
             esp_task_wdt_reset();
         if (simulate_crash_motor)
             while (1)
-            {
                 vTaskDelay(1);
-            }
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(5));
         if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(1)) == pdTRUE)
         {
@@ -1091,7 +1280,32 @@ void vMotorControlTask(void *pvParameters)
     }
 }
 
-void vInputTask(void *pvParameters)
+void vRFTask(void *pvParameters)
+{
+    if (ENABLE_HW_WATCHDOG)
+        esp_task_wdt_add(NULL);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    while (1)
+    {
+        last_checkin_rf = millis();
+        if (ENABLE_HW_WATCHDOG)
+            esp_task_wdt_reset();
+        if (simulate_crash_rf)
+            while (1)
+                vTaskDelay(1);
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
+        if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(5)) == pdTRUE)
+        {
+            if (rf_learn_state != RF_LEARN_INACTIVE)
+                handle_rf_learning();
+            else
+                handle_rf_signal();
+            xSemaphoreGive(xStateMutex);
+        }
+    }
+}
+
+void vButtonTask(void *pvParameters)
 {
     if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
@@ -1104,15 +1318,14 @@ void vInputTask(void *pvParameters)
 
     while (1)
     {
-        last_checkin_input = millis();
+        last_checkin_button = millis();
         if (ENABLE_HW_WATCHDOG)
             esp_task_wdt_reset();
-        if (simulate_crash_input)
+        if (simulate_crash_button)
             while (1)
-            {
                 vTaskDelay(1);
-            }
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
+
         mainButton.loop();
         maintenanceButton.loop();
         wifiButton.loop();
@@ -1135,7 +1348,7 @@ void vInputTask(void *pvParameters)
             }
             else if (!combo_triggered)
             {
-                LOG_PRINTLN("Combo: Entering RF Learn Mode!");
+                LOG_PRINTLN("Combo: RF Learn Mode!");
                 send_command(CMD_RF_LEARN_START);
                 combo_triggered = true;
             }
@@ -1152,29 +1365,29 @@ void vInputTask(void *pvParameters)
                     wifi_press_start = millis();
                 unsigned long held = millis() - wifi_press_start;
                 if (held < WIFI_CONFIG_LONG_PRESS_TIME)
-                { /* logic if needed */
+                {
+                    if (millis() - last_print_combo > 1000)
+                    {
+                        last_print_combo = millis();
+                        LOG_PRINTF("WiFi Config in %lu s...\n", (WIFI_CONFIG_LONG_PRESS_TIME - held) / 1000 + 1);
+                    }
                 }
             }
             else
+            {
+                if (wifi_press_start > 0 && (millis() - wifi_press_start > WIFI_CONFIG_LONG_PRESS_TIME))
+                {
+                    send_command(CMD_WIFI_CONFIG_START);
+                }
                 wifi_press_start = 0;
+            }
             if (m)
             {
                 if (maint_press_start == 0)
                     maint_press_start = millis();
-                /* logic if needed */
             }
             else
                 maint_press_start = 0;
-        }
-
-        if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(1)) == pdTRUE)
-        {
-            if (rf_learn_state != RF_LEARN_INACTIVE)
-                handle_rf_learning();
-            else
-                handle_rf_signal();
-            handle_indicator_light();
-            xSemaphoreGive(xStateMutex);
         }
     }
 }
@@ -1184,9 +1397,11 @@ void vNetworkTask(void *pvParameters)
     if (ENABLE_HW_WATCHDOG)
         esp_task_wdt_add(NULL);
     TickType_t xLastWakeTime = xTaskGetTickCount();
-
-    // [CHANGE] We no longer log from here. Only MQTT publish.
     int mqttCounter = 0;
+    // [NEW] Last broadcast time
+    unsigned long last_ws_broadcast = 0;
+
+    wm.setConfigPortalBlocking(false);
 
     while (1)
     {
@@ -1195,14 +1410,52 @@ void vNetworkTask(void *pvParameters)
             esp_task_wdt_reset();
         if (simulate_crash_network)
             while (1)
-            {
                 vTaskDelay(1);
-            }
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
+
+        wm.process();
+
+        if (wifi_config_request)
+        {
+            LOG_PRINTLN("Manual Config Portal Requested...");
+            if (ENABLE_HW_WATCHDOG)
+                esp_task_wdt_delete(NULL);
+            wm.setConfigPortalBlocking(true);
+            wm.startConfigPortal("GateControllerAP");
+            wm.setConfigPortalBlocking(false);
+            if (ENABLE_HW_WATCHDOG)
+                esp_task_wdt_add(NULL);
+            wifi_config_request = false;
+            LOG_PRINTLN("Portal Closed.");
+        }
+
+        // Web server tick (approx every 25ms due to delay below)
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(25));
 
         if (WiFi.status() == WL_CONNECTED)
         {
+            if (!web_server_started)
+            {
+                server.begin();
+                webSocket.begin(); // Start WebSocket
+                webSocket.onEvent(onWebSocketEvent);
+                MDNS.begin("gate");
+                web_server_started = true;
+                LOG_PRINTLN("Web+WS Server Started");
+            }
+            server.handleClient();
+            webSocket.loop(); // Handle WS events
             mqtt.loop();
+
+            // [NEW] Broadcast Status periodically via WebSocket
+            // Updates more frequently (250ms) if moving, less (2000ms) if idle
+            unsigned long interval = (current_operation != IDLE) ? 250 : 2000;
+            if (millis() - last_ws_broadcast > interval)
+            {
+                broadcastStatus();
+                last_ws_broadcast = millis();
+            }
+
+            // Telnet Handling
             if (telnetServer.hasClient())
             {
                 if (!telnetClient || !telnetClient.connected())
@@ -1217,11 +1470,10 @@ void vNetworkTask(void *pvParameters)
             {
                 String cmd = telnetClient.readStringUntil('\n');
                 cmd.trim();
-                
                 if (cmd.equalsIgnoreCase("logs"))
                     dump_system_log();
-                else if (cmd.equalsIgnoreCase("conf")) dump_config(); // [NEW]
-
+                else if (cmd.equalsIgnoreCase("conf"))
+                    dump_config();
                 else if (cmd.equalsIgnoreCase("clear_logs"))
                 {
                     LittleFS.remove(LOG_FILE);
@@ -1245,7 +1497,7 @@ void vNetworkTask(void *pvParameters)
                 }
                 else if (cmd.equalsIgnoreCase("crash input"))
                 {
-                    simulate_crash_input = true;
+                    simulate_crash_button = true;
                     LOG_PRINTLN("Simulating INPUT crash...");
                 }
                 else if (cmd.equalsIgnoreCase("crash logger"))
@@ -1253,15 +1505,39 @@ void vNetworkTask(void *pvParameters)
                     simulate_crash_logger = true;
                     LOG_PRINTLN("Simulating LOGGER crash...");
                 }
+                else if (cmd.equalsIgnoreCase("learn_rf"))
+                {
+                    send_command(CMD_RF_LEARN_START);
+                }
+                else if (cmd.equalsIgnoreCase("rmove_rf"))
+                {
+                    if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+                    {
+                        rf_gate_open_code = 0;
+                        rf_gate_close_code = 0;
+                        rf_gate_stop_code = 0;
+                        rf_gate_pos50_code = 0;
+                        save_params();
+                        xSemaphoreGive(xStateMutex);
+                        LOG_PRINTLN("RF codes removed.");
+                    }
+                }
+                else if (cmd.equalsIgnoreCase("start_cal"))
+                {
+                    send_command(CMD_CALIBRATE_START);
+                }
+                else if (cmd.equalsIgnoreCase("wifi"))
+                {
+                    wifi_config_request = true;
+                }
             }
         }
         handle_wifi_status();
 
         mqttCounter++;
-        if (mqttCounter >= 10)
-        { // Every 5 seconds
+        if (mqttCounter >= 200) // Adjusted for faster loop (25ms * 200 = 5s)
+        {
             mqttCounter = 0;
-            // Only publish MQTT states here. Logging moved to vLoggerTask.
             if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(10)) == pdTRUE)
             {
                 publish_all_states();
@@ -1271,18 +1547,6 @@ void vNetworkTask(void *pvParameters)
     }
 }
 
-void vConfigPortalTask(void *pvParameters)
-{
-    if (hNetworkTask != NULL)
-        vTaskSuspend(hNetworkTask);
-    LOG_PRINTLN("Config Portal Started...");
-    wm.setConfigPortalTimeout(180);
-    wm.startConfigPortal("GateControllerAP");
-    delay(1000);
-    ESP.restart();
-    vTaskDelete(NULL);
-}
-
 void setup()
 {
     xLogMutex = xSemaphoreCreateMutex();
@@ -1290,7 +1554,6 @@ void setup()
     xMotorRelayMutex = xSemaphoreCreateMutex();
     xCommandQueue = xQueueCreate(10, sizeof(CommandMessage));
 
-// [CRITICAL] Disable Serial if using Pin 1 for Motor
 #if USE_SERIAL_DEBUG
     Serial.begin(115200);
 #endif
@@ -1314,6 +1577,8 @@ void setup()
     if (!LittleFS.begin(true))
         LOG_PRINTLN("LittleFS Failed!");
     check_reset_reason();
+
+    // Load Params
     load_params();
 
 #if MOTOR_CONTROL_MODE == 1
@@ -1339,58 +1604,114 @@ void setup()
     device.setUniqueId(mac, sizeof(mac));
     device.setName("Sliding Gate");
     device.setModel("ESP32-C3");
+    device.setManufacturer("Custom");
+
+    // --- CONFIGURE HOME ASSISTANT ENTITIES ---
+
+    // Main Cover
     cover.setName("Sliding Gate");
     cover.setDeviceClass("gate");
     cover.onCommand(onCoverCommand);
+
+    // Control Buttons
+    openButtonHA.setName("Open Gate");
+    openButtonHA.setIcon("mdi:gate-open");
     openButtonHA.onCommand(onOpenCommand);
+
+    closeButtonHA.setName("Close Gate");
+    closeButtonHA.setIcon("mdi:gate");
     closeButtonHA.onCommand(onCloseCommand);
+
+    stopButtonHA.setName("Stop Gate");
+    stopButtonHA.setIcon("mdi:stop-circle-outline");
     stopButtonHA.onCommand(onStopCommand);
+
+    calibrateButton.setName("Calibrate Gate");
+    calibrateButton.setIcon("mdi:ruler");
     calibrateButton.onCommand(onCalibrateCommand);
+
+    moveTo50Button.setName("Pedestrian (50%)");
+    moveTo50Button.setIcon("mdi:walk");
     moveTo50Button.onCommand(onMoveTo50Command);
+
+    // Sensors
+    rfCodeSensor.setName("Last RF Code");
+    rfCodeSensor.setIcon("mdi:remote");
+
+    gateState.setName("Gate Logic State");
+    gateState.setIcon("mdi:state-machine");
+
+    gateIP.setName("Gate IP Address");
+    gateIP.setIcon("mdi:ip-network");
+
+    travelTimeSensor.setName("Travel Duration");
+    travelTimeSensor.setIcon("mdi:timer-outline");
+    travelTimeSensor.setUnitOfMeasurement("s");
 
     mainButton.begin(MANUAL_MAIN_BUTTON_PIN, INPUT_PULLUP, true);
     mainButton.setReleasedHandler(main_button_short_press);
     mainButton.setLongClickHandler(main_button_long_press);
     mainButton.setLongClickTime(REVERSE_LONG_PRESS_TIME);
+    mainButton.setDebounceTime(50);
 
     maintenanceButton.begin(MANUAL_MAINTENANCE_BUTTON_PIN, INPUT_PULLUP, true);
     maintenanceButton.setReleasedHandler(maintenance_button_short_press);
     maintenanceButton.setLongClickHandler(maintenance_button_long_press);
     maintenanceButton.setLongClickTime(CALIBRATION_LONG_PRESS_TIME);
+    maintenanceButton.setDebounceTime(50);
 
     wifiButton.begin(MANUAL_WIFI_BUTTON_PIN, INPUT_PULLUP, true);
     wifiButton.setReleasedHandler(wifi_button_short_press);
     wifiButton.setLongClickHandler(wifi_config_long_press);
     wifiButton.setLongClickTime(WIFI_CONFIG_LONG_PRESS_TIME);
+    wifiButton.setDebounceTime(50);
 
-    wm.addParameter(&custom_mqtt_server);
-    wm.addParameter(&custom_mqtt_port);
-    wm.addParameter(&custom_mqtt_user);
-    wm.addParameter(&custom_mqtt_password);
+    // Setup Custom Web Server Routes
+    server.on("/", handleRoot);
+    server.on("/config", handleConfigPage);
+    server.on("/save", HTTP_POST, handleSavePage);
+    server.onNotFound(handleWebCommand); // Handles /open, /close, /stop
 
     mySwitch.enableReceive(RF_RECEIVER_PIN);
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    WiFi.begin();
+
+    wm.setConfigPortalBlocking(false);
+    // [CHANGE] No custom params added to WM anymore
+    wm.setDebugOutput(false);
+
+    if (wm.autoConnect("GateControllerAP"))
+    {
+        LOG_PRINTLN("Connected...yeey :)");
+    }
+    else
+    {
+        LOG_PRINTLN("Not connected, Config Portal running in background...");
+    }
 
     uint16_t port = atoi(mqtt_port_str);
     mqtt.begin(mqtt_server, port, mqtt_user, mqtt_password);
     telnetServer.begin();
 
-    last_checkin_motor = millis();
-    last_checkin_network = millis();
-    last_checkin_input = millis();
-    last_checkin_gate = millis();
-    last_checkin_logger = millis();
+    unsigned long now = millis();
+    last_checkin_motor = now;
+    last_checkin_network = now;
+    last_checkin_rf = now;
+    last_checkin_button = now;
+    last_checkin_gate = now;
+    last_checkin_logger = now;
+    last_checkin_led = now;
 
     xTaskCreate(vSupervisorTask, "Supervisor", 3072, NULL, 5, NULL);
-    xTaskCreate(vLoggerTask, "Logger", 4096, NULL, 1, NULL); // [NEW] Added dedicated Logger Task
-    xTaskCreate(vMotorControlTask, "MotorControl", 4096, NULL, 4, NULL);
-    xTaskCreate(vInputTask, "InputReader", 3072, NULL, 3, NULL);
-    xTaskCreate(vGateStateTask, "GateStateManager", 4096, NULL, 2, NULL);
-    xTaskCreate(vNetworkTask, "NetworkManager", 4096, NULL, 1, &hNetworkTask);
+    xTaskCreate(vMotorTask, "Motor", 4096, NULL, 4, NULL);
+    xTaskCreate(vGateLogicTask, "GateLogic", 4096, NULL, 3, NULL);
+    xTaskCreate(vRFTask, "RF", 3072, NULL, 3, NULL);
+    xTaskCreate(vButtonTask, "Button", 3072, NULL, 3, NULL);
+    xTaskCreate(vNetworkTask, "Network", 4096, NULL, 2, &hNetworkTask);
+    xTaskCreate(vLedTask, "LED", 2048, NULL, 1, NULL);
+    xTaskCreate(vLoggerTask, "Logger", 4096, NULL, 1, NULL);
 
-    LOG_PRINTLN("Setup Complete. Scheduler Running.");
+    LOG_PRINTLN("Setup Complete. 8 Tasks Running.");
 }
 
 void loop()
