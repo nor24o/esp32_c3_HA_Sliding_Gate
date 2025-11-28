@@ -22,7 +22,7 @@ Unlike basic controllers, this firmware features a **self-contained Web Dashboar
     * **Auto-Close**: Configurable timer to automatically close the gate after an obstacle is cleared.
     * **Limit Switches**: Input support for Open and Close limit switches.
     * **Motor Protection**: Configurable delay before reversing motor direction to save gears.
-* **Persistent Storage**: Uses ESP32 **Preferences (NVS)** for crash-proof saving of configuration and RF codes.
+* **Persistent Storage**: Uses ESP32 **Preferences (NVS)** for crash-proof saving of configuration and RF codes (replaces fragile file-based config).
 * **WiFi Manager**: Creates a captive portal hotspot (`GateControllerAP`) for easy initial setup of WiFi credentials.
 
 ## 🧠 Software Architecture (FreeRTOS)
@@ -31,10 +31,10 @@ The firmware leverages **FreeRTOS** to handle multiple tasks simultaneously, ens
 
 | Task Name | Priority | Description |
 | :--- | :--- | :--- |
-| **Supervisor** | 5 (High) | **Watchdog Monitor.** constantly checks if other tasks are responsive. If a task hangs (e.g., WiFi freezes), it reboots the system to restore functionality. |
+| **Supervisor** | 5 (High) | **Watchdog Monitor.** Constantly checks if other tasks are responsive. If a task hangs (e.g., WiFi freezes), it reboots the system to restore functionality. |
 | **Motor** | 4 | **Safety Core.** Runs continuously to monitor Limit Switches and Photo Barriers. Directly controls relays to ensure immediate stop reaction (<10ms) regardless of WiFi status. |
 | **GateLogic** | 3 | **State Machine.** Processes high-level commands (Open/Close) and manages the complex state transitions (Opening -> Stopped -> Closing). |
-| **RF** | 3 | **Signal Decoder.** dedicated listener for 433MHz signals to ensure remote presses are never missed. |
+| **RF** | 3 | **Signal Decoder.** Dedicated listener for 433MHz signals to ensure remote presses are never missed. |
 | **Button** | 3 | **Input Handler.** Debounces physical push buttons to prevent phantom triggers. |
 | **Network** | 2 | **Comms Hub.** Handles WiFi connection, MQTT messaging, Web Server, and WebSocket broadcasts. |
 | **LED** | 1 | **Status Indicator.** Manages blink patterns for feedback. |
@@ -60,6 +60,17 @@ The firmware leverages **FreeRTOS** to handle multiple tasks simultaneously, ens
 | **Manual Button (Maint)**| `GPIO 7` | Input | Push Button to GND |
 
 > **Note:** All inputs use internal **Pull-Up** resistors. Wire your sensors/switches to connect the GPIO pin to **Ground (GND)** when activated.
+
+## 🛠️ Compile-Time Configuration
+
+Advanced users can modify `main.cpp` before flashing to adapt the firmware to specific hardware requirements. These settings are defined at the top of the file.
+
+| Macro | Default | Description |
+| :--- | :--- | :--- |
+| `MOTOR_CONTROL_MODE` | `2` | **Mode 1:** Relay 1 controls *Direction*; Relay 2 controls *Power/Enable*. <br> **Mode 2:** Relay 1 controls *Open*; Relay 2 controls *Close* (Interlocked). |
+| `USE_SERIAL_DEBUG` | `false` | Set to `true` **ONLY** if not using GPIO 1/3 (TX/RX) for relays. Enabling this on ESP32-C3 boards where relays are on TX/RX will cause relay chatter during boot. |
+| `ENABLE_HW_WATCHDOG` | `true` | Safety feature. Automatically reboots the ESP32 if the system freezes for >30s. |
+| `MAX_LOG_SIZE` | `5000` | Maximum size (in bytes) for the internal log file before it rotates/clears. |
 
 ## 📦 Software Dependencies
 
