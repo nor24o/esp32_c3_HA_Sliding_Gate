@@ -47,6 +47,8 @@ volatile unsigned long last_checkin_led = 0;
 volatile bool wifi_config_request = false;
 bool web_server_started = false;
 bool config_auto_close_barrier = false;
+bool config_barrier_active_high = false; // Barrier N.C. Safety
+bool config_limits_active_high = false;  // [NEW] Limits N.C. Safety
 
 // Simulation Flags
 bool simulate_crash_motor = false;
@@ -126,7 +128,6 @@ const int LIMIT_CLOSE_PIN = 20;
 const int PHOTO_BARRIER_PIN = 2;
 const int RF_RECEIVER_PIN = 5;
 
-// [CHANGED] Converted to variables for runtime configuration
 unsigned long motor_direction_delay = 700;
 unsigned long rf_debounce_delay = 400;
 unsigned long auto_close_delay = 5000;
@@ -284,6 +285,44 @@ void broadcastStatus();
 void sendRFListToWeb();
 void onCancelCalibrateCommand(HAButton *sender);
 
+// [NEW] Helper for Barrier Logic
+bool isBarrierTriggered()
+{
+    if (config_barrier_active_high)
+    {
+        return digitalRead(PHOTO_BARRIER_PIN) == HIGH;
+    }
+    else
+    {
+        return digitalRead(PHOTO_BARRIER_PIN) == LOW;
+    }
+}
+
+// [NEW] Helpers for Limit Switch Logic
+bool isOpenLimitTriggered()
+{
+    if (config_limits_active_high)
+    {
+        return digitalRead(LIMIT_OPEN_PIN) == HIGH;
+    }
+    else
+    {
+        return digitalRead(LIMIT_OPEN_PIN) == LOW;
+    }
+}
+
+bool isCloseLimitTriggered()
+{
+    if (config_limits_active_high)
+    {
+        return digitalRead(LIMIT_CLOSE_PIN) == HIGH;
+    }
+    else
+    {
+        return digitalRead(LIMIT_CLOSE_PIN) == LOW;
+    }
+}
+
 // =================================================================
 // LOGGING & WATCHDOG
 // =================================================================
@@ -336,6 +375,8 @@ void dump_config()
     LOG_PRINTF("MQTT Server: %s\n", mqtt_server);
     LOG_PRINTF("Stored RF Keys: %d\n", rfKeyList.size());
     LOG_PRINTF("Auto-Close Barrier: %d\n", config_auto_close_barrier);
+    LOG_PRINTF("Barrier Active High: %d\n", config_barrier_active_high);
+    LOG_PRINTF("Limits Active High: %d\n", config_limits_active_high);
     LOG_PRINTLN("\n--- STATE ---");
     LOG_PRINTF("Current POS: %.2f\n", current_position);
     LOG_PRINTLN("---------------------\n");
@@ -428,13 +469,13 @@ void save_params()
     gatePrefs.putString("mqtt_user", mqtt_user);
     gatePrefs.putString("mqtt_pass", mqtt_password);
     gatePrefs.putBool("ac_bar", config_auto_close_barrier);
+    gatePrefs.putBool("bar_high", config_barrier_active_high);
+    gatePrefs.putBool("lim_high", config_limits_active_high); // [NEW]
 
-    // [NEW] Save Timing Configs
     gatePrefs.putULong("mot_delay", motor_direction_delay);
     gatePrefs.putULong("rf_deb", rf_debounce_delay);
     gatePrefs.putULong("ac_delay", auto_close_delay);
 
-    // Save RF List
     if (rfKeyList.size() > 0)
     {
         gatePrefs.putBytes("rf_list", rfKeyList.data(), rfKeyList.size() * sizeof(RFEntry));
@@ -455,8 +496,9 @@ void load_params()
 
     gate_travel_time = gatePrefs.getULong("travel_time", 30000);
     config_auto_close_barrier = gatePrefs.getBool("ac_bar", false);
+    config_barrier_active_high = gatePrefs.getBool("bar_high", false);
+    config_limits_active_high = gatePrefs.getBool("lim_high", false); // [NEW]
 
-    // [NEW] Load Timing Configs
     motor_direction_delay = gatePrefs.getULong("mot_delay", 700);
     rf_debounce_delay = gatePrefs.getULong("rf_deb", 400);
     auto_close_delay = gatePrefs.getULong("ac_delay", 5000);
@@ -479,7 +521,7 @@ void load_params()
     }
     else
     {
-        // Migration
+        // Migration Logic (Same as before)
         unsigned long old_open = gatePrefs.getULong("rf_open", 0);
         unsigned long old_close = gatePrefs.getULong("rf_close", 0);
         unsigned long old_stop = gatePrefs.getULong("rf_stop", 0);
@@ -624,11 +666,17 @@ void broadcastStatus()
             status = "PHYSICAL LEARN";
         }
 
+        bool barrierActive = isBarrierTriggered();
+        bool openLimActive = isOpenLimitTriggered();
+        bool closeLimActive = isCloseLimitTriggered();
+
         snprintf(json, sizeof(json),
                  "{\"type\":\"status\",\"s\":\"%s\",\"ss\":\"%s\",\"p\":%d,\"lo\":%d,\"lc\":%d,\"pb\":%d,\"rf\":%lu}",
                  status.c_str(), subStatus.c_str(),
                  (int)(current_position * 100),
-                 digitalRead(LIMIT_OPEN_PIN), digitalRead(LIMIT_CLOSE_PIN), digitalRead(PHOTO_BARRIER_PIN),
+                 openLimActive ? 0 : 1, // 0 = Hit (Red)
+                 closeLimActive ? 0 : 1,
+                 barrierActive ? 0 : 1,
                  last_rf_code_received);
         webSocket.broadcastTXT(json);
     }
@@ -783,10 +831,14 @@ void handleConfigPage()
     html += "<label>RF Debounce (ms):</label><input type='number' name='rfd' value='" + String(rf_debounce_delay) + "'>";
     html += "<label>Auto-Close Delay (ms):</label><input type='number' name='acd' value='" + String(auto_close_delay) + "'>";
 
-    // Checkbox
-    String checked = config_auto_close_barrier ? "checked" : "";
-    html += "<div style='text-align:left;margin:10px 0;padding:5px;background:#eee;border-radius:4px'>";
-    html += "<label style='font-weight:bold;display:flex;align-items:center'><input type='checkbox' name='ac_bar' " + checked + " style='width:20px;height:20px;margin-right:10px'> Auto-Close after Barrier</label></div>";
+    String checkedAC = config_auto_close_barrier ? "checked" : "";
+    String checkedBH = config_barrier_active_high ? "checked" : "";
+    String checkedLH = config_limits_active_high ? "checked" : "";
+
+    html += "<div style='text-align:left;margin:10px 0;padding:10px;background:#eee;border-radius:4px'>";
+    html += "<label style='font-weight:bold;display:block;margin-bottom:5px'><input type='checkbox' name='ac_bar' " + checkedAC + "> Auto-Close after Barrier</label>";
+    html += "<label style='font-weight:bold;display:block;margin-bottom:5px'><input type='checkbox' name='bh' " + checkedBH + "> Barrier Active HIGH (N.C. Mode)</label>";
+    html += "<label style='font-weight:bold;display:block'><input type='checkbox' name='lh' " + checkedLH + "> Limit Switches Active HIGH (N.C. Mode)</label></div>";
 
     html += "<input type='submit' value='SAVE & REBOOT'>";
     html += "</form><br><center><a href='/'>Back to Controls</a></center></div></body></html>";
@@ -817,7 +869,6 @@ void handleSavePage()
     {
         gate_travel_time = server.arg("tt").toInt();
     }
-    // [NEW] Save new timing params
     if (server.hasArg("mdd"))
     {
         motor_direction_delay = server.arg("mdd").toInt();
@@ -832,6 +883,8 @@ void handleSavePage()
     }
 
     config_auto_close_barrier = server.hasArg("ac_bar");
+    config_barrier_active_high = server.hasArg("bh");
+    config_limits_active_high = server.hasArg("lh"); // [NEW]
 
     save_params();
 
@@ -924,9 +977,11 @@ void publish_all_states()
         gateState.setValue("stopped");
     gateIP.setValue(WiFi.localIP().toString().c_str());
 
-    limitOpenSensor.setState(digitalRead(LIMIT_OPEN_PIN) == LOW);
-    limitCloseSensor.setState(digitalRead(LIMIT_CLOSE_PIN) == LOW);
-    barrierSensor.setState(digitalRead(PHOTO_BARRIER_PIN) == LOW);
+    limitOpenSensor.setState(isOpenLimitTriggered());
+    limitCloseSensor.setState(isCloseLimitTriggered());
+
+    // [UPDATED] Publish Barrier State using helper
+    barrierSensor.setState(isBarrierTriggered());
 }
 
 void move_to_position(float new_target)
@@ -1046,7 +1101,6 @@ void handle_rf_signal()
     bool is_repeat = false;
     if (code == last_rf_code_received)
     {
-        // [FIXED] Use variable 'rf_debounce_delay' instead of missing constant
         if (now - last_rf_process_time < rf_debounce_delay)
             is_repeat = true;
     }
@@ -1093,7 +1147,6 @@ void handle_motor_relays()
 #if MOTOR_CONTROL_MODE == 1
     if (motor_relay_state == R_OFF)
         return;
-    // [FIXED] Use variable 'motor_direction_delay'
     if (millis() - motor_relay_timer >= motor_direction_delay)
     {
         if (motor_relay_state == R_WAIT_ENABLE)
@@ -1111,7 +1164,6 @@ void handle_motor_relays()
 #elif MOTOR_CONTROL_MODE == 2
     if (motor_change_state == M_WAIT_FOR_ENGAGE)
     {
-        // [FIXED] Use variable 'motor_direction_delay'
         if (millis() - motor_change_timer >= motor_direction_delay)
         {
             if (xSemaphoreTake(xMotorRelayMutex, pdMS_TO_TICKS(1)) == pdTRUE)
@@ -1186,7 +1238,7 @@ void start_opening()
     last_operation_before_stop = IDLE;
     if (current_operation != IDLE || cal_state != CAL_INACTIVE)
         return;
-    if (current_position >= 0.99f || digitalRead(LIMIT_OPEN_PIN) == LOW)
+    if (current_position >= 0.99f || isOpenLimitTriggered())
     {
         LOG_PRINTLN("Cannot open: Limit.");
         return;
@@ -1200,12 +1252,13 @@ void start_closing()
     last_operation_before_stop = IDLE;
     if (current_operation != IDLE || cal_state != CAL_INACTIVE)
         return;
-    if (current_position <= 0.01f || digitalRead(LIMIT_CLOSE_PIN) == LOW)
+    if (current_position <= 0.01f || isCloseLimitTriggered())
     {
         LOG_PRINTLN("Cannot close: Limit.");
         return;
     }
-    if (digitalRead(PHOTO_BARRIER_PIN) == LOW)
+    // [UPDATED] Use helper check
+    if (isBarrierTriggered())
     {
         LOG_PRINTLN("Cannot close: Sensor blocked.");
         return;
@@ -1238,7 +1291,7 @@ void handle_calibration()
     switch (cal_state)
     {
     case CAL_HOMING_CLOSE:
-        if (digitalRead(LIMIT_CLOSE_PIN) == LOW)
+        if (isCloseLimitTriggered())
         {
             log_info("CAL: Homing Done. Opening...");
             stop_movement(false);
@@ -1254,7 +1307,7 @@ void handle_calibration()
         break;
 
     case CAL_MEASURING_OPEN:
-        if (digitalRead(LIMIT_OPEN_PIN) == LOW)
+        if (isOpenLimitTriggered())
         {
             gate_travel_time = millis() - movement_start_time;
             log_info("CAL: Measured Time: " + String(gate_travel_time) + "ms");
@@ -1267,7 +1320,7 @@ void handle_calibration()
         break;
 
     case CAL_VERIFYING_CLOSE:
-        if (digitalRead(LIMIT_CLOSE_PIN) == LOW)
+        if (isCloseLimitTriggered())
         {
             stop_movement(false);
             log_info("CAL: Calibration Complete & Saved.");
@@ -1370,17 +1423,19 @@ void handle_safety_sensors()
 {
     if (cal_state != CAL_INACTIVE)
         return;
-    if (current_operation == OPENING && digitalRead(LIMIT_OPEN_PIN) == LOW)
+    if (current_operation == OPENING && isOpenLimitTriggered())
     {
         stop_movement(false);
         current_position = 1.0f;
     }
-    if (current_operation == CLOSING && digitalRead(LIMIT_CLOSE_PIN) == LOW)
+    if (current_operation == CLOSING && isCloseLimitTriggered())
     {
         stop_movement(false);
         current_position = 0.0f;
     }
-    if (digitalRead(PHOTO_BARRIER_PIN) == LOW && current_operation == CLOSING)
+
+    // [UPDATED] Use helper check for barrier
+    if (isBarrierTriggered() && current_operation == CLOSING)
     {
         LOG_PRINTLN("Barrier!");
         stop_movement(false);
