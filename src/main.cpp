@@ -46,7 +46,7 @@ volatile unsigned long last_checkin_led = 0;
 // Flags
 volatile bool wifi_config_request = false;
 bool web_server_started = false;
-bool config_auto_close_barrier = false; // [NEW] Config Option
+bool config_auto_close_barrier = false;
 
 // Simulation Flags
 bool simulate_crash_motor = false;
@@ -126,22 +126,30 @@ const int LIMIT_CLOSE_PIN = 20;
 const int PHOTO_BARRIER_PIN = 2;
 const int RF_RECEIVER_PIN = 5;
 
-unsigned long MOTOR_DIRECTION_DELAY = 700;
+// [CHANGED] Converted to variables for runtime configuration
+unsigned long motor_direction_delay = 700;
+unsigned long rf_debounce_delay = 400;
+unsigned long auto_close_delay = 5000;
+unsigned long gate_travel_time = 30000;
+
 unsigned long CALIBRATION_LONG_PRESS_TIME = 8000;
 unsigned long WIFI_CONFIG_LONG_PRESS_TIME = 5000;
 unsigned long WIFI_RETRY_INTERVAL = 30000;
 const unsigned long REVERSE_LONG_PRESS_TIME = 1000;
 const unsigned long RF_LEARN_TIMEOUT = 60000;
 const unsigned long RF_LEARN_SAVE_LONG_PRESS_TIME = 1500;
-const unsigned long RF_DEBOUNCE_DELAY = 400;
 const unsigned long COMBO_MODE_HOLD_TIME = 2000;
 const unsigned long CALIBRATION_SAFETY_TIMEOUT = 90000;
 
-unsigned long gate_travel_time = 30000;
 char mqtt_server[40] = "192.168.1.12";
 char mqtt_port_str[6] = "1883";
 char mqtt_user[32] = "admin";
 char mqtt_password[64] = "admin";
+
+unsigned long rf_gate_open_code = 1234567;
+unsigned long rf_gate_close_code = 7654321;
+unsigned long rf_gate_stop_code = 1111111;
+unsigned long rf_gate_pos50_code = 2222222;
 
 unsigned long last_blink_time = 0;
 unsigned long blink_interval = 0;
@@ -419,7 +427,12 @@ void save_params()
     gatePrefs.putString("mqtt_port", mqtt_port_str);
     gatePrefs.putString("mqtt_user", mqtt_user);
     gatePrefs.putString("mqtt_pass", mqtt_password);
-    gatePrefs.putBool("ac_bar", config_auto_close_barrier); // [NEW] Save Auto Close Setting
+    gatePrefs.putBool("ac_bar", config_auto_close_barrier);
+
+    // [NEW] Save Timing Configs
+    gatePrefs.putULong("mot_delay", motor_direction_delay);
+    gatePrefs.putULong("rf_deb", rf_debounce_delay);
+    gatePrefs.putULong("ac_delay", auto_close_delay);
 
     // Save RF List
     if (rfKeyList.size() > 0)
@@ -441,7 +454,12 @@ void load_params()
     gatePrefs.begin("gate_conf", false);
 
     gate_travel_time = gatePrefs.getULong("travel_time", 30000);
-    config_auto_close_barrier = gatePrefs.getBool("ac_bar", false); // [NEW] Load Auto Close Setting
+    config_auto_close_barrier = gatePrefs.getBool("ac_bar", false);
+
+    // [NEW] Load Timing Configs
+    motor_direction_delay = gatePrefs.getULong("mot_delay", 700);
+    rf_debounce_delay = gatePrefs.getULong("rf_deb", 400);
+    auto_close_delay = gatePrefs.getULong("ac_delay", 5000);
 
     String s = gatePrefs.getString("mqtt_server", "192.168.1.12");
     s.toCharArray(mqtt_server, 40);
@@ -758,11 +776,17 @@ void handleConfigPage()
     html += "<label>MQTT Port:</label><input type='text' name='mq_pt' value='" + String(mqtt_port_str) + "'>";
     html += "<label>MQTT User:</label><input type='text' name='mq_us' value='" + String(mqtt_user) + "'>";
     html += "<label>MQTT Pass:</label><input type='password' name='mq_pw' value='" + String(mqtt_password) + "'>";
-    html += "<label>Travel Time (ms):</label><input type='number' name='tt' value='" + String(gate_travel_time) + "'>";
 
-    // [NEW] Auto-Close Checkbox
+    html += "<hr><h3 style='margin-bottom:5px'>Timing Settings</h3>";
+    html += "<label>Travel Time (ms):</label><input type='number' name='tt' value='" + String(gate_travel_time) + "'>";
+    html += "<label>Motor Direction Delay (ms):</label><input type='number' name='mdd' value='" + String(motor_direction_delay) + "'>";
+    html += "<label>RF Debounce (ms):</label><input type='number' name='rfd' value='" + String(rf_debounce_delay) + "'>";
+    html += "<label>Auto-Close Delay (ms):</label><input type='number' name='acd' value='" + String(auto_close_delay) + "'>";
+
+    // Checkbox
     String checked = config_auto_close_barrier ? "checked" : "";
-    html += "<div style='text-align:left;margin:10px 0'><label style='font-weight:bold'><input type='checkbox' name='ac_bar' " + checked + " style='width:auto'> Auto-Close after Barrier</label></div>";
+    html += "<div style='text-align:left;margin:10px 0;padding:5px;background:#eee;border-radius:4px'>";
+    html += "<label style='font-weight:bold;display:flex;align-items:center'><input type='checkbox' name='ac_bar' " + checked + " style='width:20px;height:20px;margin-right:10px'> Auto-Close after Barrier</label></div>";
 
     html += "<input type='submit' value='SAVE & REBOOT'>";
     html += "</form><br><center><a href='/'>Back to Controls</a></center></div></body></html>";
@@ -793,9 +817,20 @@ void handleSavePage()
     {
         gate_travel_time = server.arg("tt").toInt();
     }
+    // [NEW] Save new timing params
+    if (server.hasArg("mdd"))
+    {
+        motor_direction_delay = server.arg("mdd").toInt();
+    }
+    if (server.hasArg("rfd"))
+    {
+        rf_debounce_delay = server.arg("rfd").toInt();
+    }
+    if (server.hasArg("acd"))
+    {
+        auto_close_delay = server.arg("acd").toInt();
+    }
 
-    // [NEW] Capture Checkbox state.
-    // Checkboxes only send a value if checked. If unchecked, hasArg returns false.
     config_auto_close_barrier = server.hasArg("ac_bar");
 
     save_params();
@@ -1011,7 +1046,8 @@ void handle_rf_signal()
     bool is_repeat = false;
     if (code == last_rf_code_received)
     {
-        if (now - last_rf_process_time < RF_DEBOUNCE_DELAY)
+        // [FIXED] Use variable 'rf_debounce_delay' instead of missing constant
+        if (now - last_rf_process_time < rf_debounce_delay)
             is_repeat = true;
     }
     last_rf_code_received = code;
@@ -1057,7 +1093,8 @@ void handle_motor_relays()
 #if MOTOR_CONTROL_MODE == 1
     if (motor_relay_state == R_OFF)
         return;
-    if (millis() - motor_relay_timer >= MOTOR_DIRECTION_DELAY)
+    // [FIXED] Use variable 'motor_direction_delay'
+    if (millis() - motor_relay_timer >= motor_direction_delay)
     {
         if (motor_relay_state == R_WAIT_ENABLE)
         {
@@ -1074,7 +1111,8 @@ void handle_motor_relays()
 #elif MOTOR_CONTROL_MODE == 2
     if (motor_change_state == M_WAIT_FOR_ENGAGE)
     {
-        if (millis() - motor_change_timer >= MOTOR_DIRECTION_DELAY)
+        // [FIXED] Use variable 'motor_direction_delay'
+        if (millis() - motor_change_timer >= motor_direction_delay)
         {
             if (xSemaphoreTake(xMotorRelayMutex, pdMS_TO_TICKS(1)) == pdTRUE)
             {
@@ -1688,6 +1726,8 @@ void vNetworkTask(void *pvParameters)
     int mqttCounter = 0;
     // [NEW] Last broadcast time
     unsigned long last_ws_broadcast = 0;
+    // [NEW] Auto-Close Timer
+    unsigned long ac_timer = 0;
 
     wm.setConfigPortalBlocking(false);
 
@@ -1747,14 +1787,13 @@ void vNetworkTask(void *pvParameters)
             }
 
             // [NEW] Auto-Close Logic (Runs in loop to handle timing)
-            static unsigned long ac_timer = 0;
             if (config_auto_close_barrier && auto_resume_is_armed && current_operation == IDLE)
             {
                 // If armed and stopped (fully open usually), start countdown
                 if (ac_timer == 0)
                     ac_timer = millis();
-                if (millis() - ac_timer > 5000)
-                { // 5 Seconds Delay
+                if (millis() - ac_timer > auto_close_delay)
+                {
                     send_command(CMD_CLOSE);
                     auto_resume_is_armed = false;
                     ac_timer = 0;
