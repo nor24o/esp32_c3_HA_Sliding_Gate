@@ -60,6 +60,13 @@ void MotorController::handleIndicator()
 
 void MotorController::executeOpenSequence()
 {
+    if (isOpenLimit())
+    {
+        currentPosition = 1.0f; // Force sync position to 100%
+        stop(false);            // Ensure state is clean
+        return;                 // ABORT: Do not touch relays
+    }
+
     if (currentOperation == OPENING)
         return;
     currentOperation = OPENING;
@@ -85,6 +92,12 @@ void MotorController::executeOpenSequence()
 
 void MotorController::executeCloseSequence()
 {
+    if (isCloseLimit())
+    {
+        currentPosition = 0.0f; // Force sync position to 0%
+        stop(false);            // Ensure state is clean
+        return;                 // ABORT: Do not touch relays
+    }
     if (currentOperation == CLOSING)
         return;
     currentOperation = CLOSING;
@@ -216,6 +229,11 @@ void MotorController::moveTo(float target)
         return;
     if (currentOperation != IDLE)
         stop(false);
+    if (target < currentPosition && isBarrierTriggered())
+    {
+        LOG_PRINTLN("Cannot MoveTo: Barrier Blocked");
+        return; // <--- Abort command immediately
+    }
     if (abs(currentPosition - target) < 0.01)
         return;
     targetPosition = target;
@@ -288,6 +306,7 @@ void MotorController::checkSafety()
         {
             LOG_PRINTLN("Barrier Triggered!");
             stop(false);
+            targetPosition = -1.0;
             autoResumeArmed = true;
             executeOpenSequence();
         }
@@ -384,4 +403,35 @@ void MotorController::logIO()
              digitalRead(LIMIT_OPEN_PIN), digitalRead(LIMIT_CLOSE_PIN), digitalRead(PHOTO_BARRIER_PIN),
              m1, m2, digitalRead(RELAY_INDICATOR_LIGHT_PIN), currentPosition);
     LOG_PRINTLN(buf);
+}
+
+void MotorController::handleAutoClose()
+{
+    // Only run if we are fully Stopped, Calibrated, and Auto Resume is armed
+    if (currentOperation == IDLE && calState == CAL_INACTIVE && autoResumeArmed)
+    {
+        // 1. If timer hasn't started, start it now
+        if (acTimer == 0)
+        {
+            acTimer = millis();
+            sysConfig.logInfo("Auto Resume: Waiting to close...");
+        }
+
+        // 2. Check if the delay time has passed
+        if (millis() - acTimer > sysConfig.config.ac_delay)
+        {
+            sysConfig.logInfo("Auto Resume: Closing now");
+            autoResumeArmed = false; // Reset the flag
+            acTimer = 0;             // Reset the timer
+            close();                 // Trigger the Close command
+        }
+    }
+    else
+    {
+        // If the user interrupts or the gate moves, kill the timer
+        if (currentOperation != IDLE)
+        {
+            acTimer = 0;
+        }
+    }
 }

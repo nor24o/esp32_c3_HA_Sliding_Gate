@@ -36,6 +36,7 @@ public:
     void checkSafety();
     void runCalibration();
     void handleIndicator();
+    void handleAutoClose(); // <--- Add this line
 
     // IO Checks
     bool isBarrierTriggered();

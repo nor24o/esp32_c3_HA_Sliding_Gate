@@ -88,6 +88,7 @@ void vMotorTask(void *pvParameters)
             gateMotor.checkSafety();
             gateMotor.handleRelays();
             gateMotor.updatePosition();
+            gateMotor.handleAutoClose(); // <--- Add this line here
             if (gateMotor.calState != CAL_INACTIVE)
                 gateMotor.runCalibration();
             xSemaphoreGive(xStateMutex);
