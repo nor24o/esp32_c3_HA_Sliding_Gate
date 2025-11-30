@@ -120,13 +120,13 @@ const int RELAY_MOTOR_CLOSE_PIN = 4;
 #endif
 
 const int RELAY_INDICATOR_LIGHT_PIN = 3;
-const int MANUAL_MAIN_BUTTON_PIN = 21;
+const int MANUAL_MAIN_BUTTON_PIN = 5;
 const int MANUAL_WIFI_BUTTON_PIN = 6;
 const int MANUAL_MAINTENANCE_BUTTON_PIN = 7;
 const int LIMIT_OPEN_PIN = 10;
 const int LIMIT_CLOSE_PIN = 20;
 const int PHOTO_BARRIER_PIN = 2;
-const int RF_RECEIVER_PIN = 5;
+const int RF_RECEIVER_PIN = 21;
 
 unsigned long motor_direction_delay = 700;
 unsigned long rf_debounce_delay = 400;
