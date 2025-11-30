@@ -54,9 +54,11 @@ private:
     HASensor gateState;
     HASensor gateIP;
     HASensor travelTime;
+    HASensor gatePosition;
     HABinarySensor limOpen;
     HABinarySensor limClose;
     HABinarySensor barrier;
+
 
     bool webServerStarted = false;
     bool configPortalRequested = false;

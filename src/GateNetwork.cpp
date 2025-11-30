@@ -13,7 +13,7 @@ void sendGlobalCmd(GateCommand cmd, float pos = -1.0)
 GateNetwork::GateNetwork() : server(80), webSocket(81), telnetServer(23), mqtt(wifiClient, device),
                              haCover("sliding_gate_cover"), rfCodeSensor("sliding_gate_last_rf_code"),
                              btnCalibrate("sliding_gate_calibrate"), btnCancelCal("sliding_gate_calibrate_cancel"),
-                             btnMove50("sliding_gate_move_to_50"), pedWidthNumber("sliding_gate_ped_width"), gateState("sliding_gate_state"),
+                             btnMove50("sliding_gate_move_to_50"), pedWidthNumber("sliding_gate_ped_width"), gateState("sliding_gate_state"), gatePosition("sliding_gate_position"),
                              gateIP("sliding_gate_IP"), travelTime("sliding_gate_travel_time"),
                              btnOpen("sliding_gate_open_button"), btnClose("sliding_gate_close_button"),
                              btnStop("sliding_gate_stop_button"), limOpen("sliding_gate_lim_open"),
@@ -24,8 +24,9 @@ GateNetwork::GateNetwork() : server(80), webSocket(81), telnetServer(23), mqtt(w
     WiFi.macAddress(mac);
     device.setUniqueId(mac, sizeof(mac));
     device.setName("Sliding Gate");
-    device.setModel("ESP32-Refactored");
-    device.setManufacturer("Custom");
+
+    device.setModel("ESP32-C3");
+    device.setManufacturer("H_N");
 
     // HA Config
     haCover.setName("Sliding Gate");
@@ -54,7 +55,7 @@ GateNetwork::GateNetwork() : server(80), webSocket(81), telnetServer(23), mqtt(w
     pedWidthNumber.setIcon("mdi:arrow-expand-horizontal");
     pedWidthNumber.setMin(10); // Minimum 10%
     pedWidthNumber.setMax(90); // Maximum 90%
-    pedWidthNumber.setStep(1);
+    pedWidthNumber.setStep(10);
     pedWidthNumber.setUnitOfMeasurement("%");
     pedWidthNumber.onCommand(onPedWidthChange);
 
@@ -67,6 +68,10 @@ GateNetwork::GateNetwork() : server(80), webSocket(81), telnetServer(23), mqtt(w
     travelTime.setName("Travel Time");
     travelTime.setIcon("mdi:timer-outline");
     travelTime.setUnitOfMeasurement("s");
+
+    gatePosition.setName("Gate Position");
+    gatePosition.setIcon("mdi:gate-arrow-left-right");
+    gatePosition.setUnitOfMeasurement("%");
 
     limOpen.setName("Open Limit");
     limOpen.setIcon("mdi:arrow-left-bold-box-outline");
@@ -161,14 +166,23 @@ void GateNetwork::broadcastStatus()
         snprintf(json, sizeof(json),
                  "{\"type\":\"status\",\"s\":\"%s\",\"ss\":\"%s\",\"p\":%d,\"lo\":%d,\"lc\":%d,\"pb\":%d,\"rf\":%lu,\"pw\":%d}",
                  status.c_str(), subStatus.c_str(), (int)(gateMotor.currentPosition * 100),
-                 gateMotor.isOpenLimit() ? 0 : 1, gateMotor.isCloseLimit() ? 0 : 1, 
+                 gateMotor.isOpenLimit() ? 0 : 1, gateMotor.isCloseLimit() ? 0 : 1,
                  gateMotor.isBarrierTriggered() ? 0 : 1, rfHandler.lastCode,
                  sysConfig.config.pedestrian_percent); // <--- Sending the config value
+
         webSocket.broadcastTXT(json);
     }
 
     // HA Updates
     haCover.setCurrentPosition(gateMotor.currentPosition * 100);
+
+    // Create a small buffer to hold the number string
+    char posBuf[8];
+    // Convert the position (0-100) into that buffer
+    snprintf(posBuf, sizeof(posBuf), "%d", (int)(gateMotor.currentPosition * 100));
+    // Send the string buffer
+    gatePosition.setValue(posBuf);
+
     char buf[16];
     snprintf(buf, sizeof(buf), "%lu", sysConfig.config.travel_time / 1000);
     travelTime.setValue(buf);
@@ -309,7 +323,7 @@ void GateNetwork::loop()
 
     if (configPortalRequested)
     {
-        if (webServerStarted) 
+        if (webServerStarted)
         {
             server.stop();
             webServerStarted = false;
@@ -318,7 +332,7 @@ void GateNetwork::loop()
         configPortalRequested = false;
     }
 
-    if (wm.getConfigPortalActive()) 
+    if (wm.getConfigPortalActive())
         return;
 
     if (WiFi.status() == WL_CONNECTED)
