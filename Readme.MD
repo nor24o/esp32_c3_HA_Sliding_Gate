@@ -58,6 +58,7 @@ The firmware leverages **FreeRTOS** to handle multiple tasks simultaneously, ens
 | **Manual Button (Main)** | `GPIO 21` | Input | Push Button to GND |
 | **Manual Button (WiFi)** | `GPIO 6` | Input | Push Button to GND (Long press for Config) |
 | **Manual Button (Maint)**| `GPIO 7` | Input | Push Button to GND |
+| **Pedestrian Open**| `GPIO 8` | Input | Push Button to GND |
 
 > **Note:** All inputs use internal **Pull-Up** resistors. Wire your sensors/switches to connect the GPIO pin to **Ground (GND)** when activated.
 
