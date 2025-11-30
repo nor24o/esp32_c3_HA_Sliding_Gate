@@ -239,6 +239,10 @@ void GateNetwork::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
             CommandMessage msg = {CMD_RF_SCAN_MODE, 0, 0, 0};
             xQueueSend(xCommandQueue, &msg, 0);
         }
+        else if (text == "WIFI_CONFIG")
+        {
+            netManager.triggerWifiConfig();
+        }
 
         if (text.startsWith("ADD:"))
         {
@@ -305,9 +309,17 @@ void GateNetwork::loop()
 
     if (configPortalRequested)
     {
+        if (webServerStarted) 
+        {
+            server.stop();
+            webServerStarted = false;
+        }
         wm.startConfigPortal("GateControllerAP");
         configPortalRequested = false;
     }
+
+    if (wm.getConfigPortalActive()) 
+        return;
 
     if (WiFi.status() == WL_CONNECTED)
     {
@@ -331,7 +343,21 @@ void GateNetwork::loop()
                 sysConfig.dumpLog();
             else if (cmd == "restart")
                 ESP.restart();
-            // ... Add other telnet commands as needed
+            else if (cmd == "clearlogs")
+                sysConfig.clearLog();
+            else if (cmd == "status")
+                broadcastStatus();
+            else if (cmd == "wificonfig")
+                triggerWifiConfig();
+            else if (cmd == "help")
+            {
+                telnetClient.println("Available commands:");
+                telnetClient.println("logs - Dump system logs");
+                telnetClient.println("clearlogs - Clear system logs");
+                telnetClient.println("status - Broadcast current status");
+                telnetClient.println("wificonfig - Start WiFi config portal");
+                telnetClient.println("restart - Restart the device");
+            }
         }
     }
 
