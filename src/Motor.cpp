@@ -117,6 +117,16 @@ void Motor::stop(bool userTriggered)
     }
 }
 
+void Motor::togglePedestrian()
+{
+    if (state != MotorState::IDLE || calState != CalState::INACTIVE) stop(true);
+    if (position > 0.05f) {
+        close();
+    } else {
+        moveTo(float(storage.cfg.pedPercent) / 100.0f);
+    }
+}
+
 void Motor::moveTo(float target)
 {
     if (calState != CalState::INACTIVE) return;
@@ -372,6 +382,12 @@ void Motor::_runCalibration()
 // ─────────────────────────────────────────────────────────────────────────────
 void Motor::_handleAutoClose()
 {
+    if (holdOpen) {
+        acTimer = 0;
+        _openTimer = 0;
+        return;
+    }
+
     // 1. Barrier-triggered auto-close
     if (autoClose && state == MotorState::IDLE && calState == CalState::INACTIVE) {
         if (acTimer == 0) {
@@ -399,4 +415,49 @@ void Motor::_handleAutoClose()
     } else {
         _openTimer = 0;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Timers info for Web GUI
+// ─────────────────────────────────────────────────────────────────────────────
+String Motor::getTimerStatus() const
+{
+    if (holdOpen) return "Hold Open Active";
+    unsigned long now = millis();
+
+    if (calState != CalState::INACTIVE) {
+        long rem = (T_CAL_SAFETY - (now - _calStart) + 999) / 1000;
+        return "Cal. Timeout in " + String(rem > 0 ? rem : 0) + "s";
+    }
+
+    if (state != MotorState::IDLE && _relayPhase == RelayPhase::IDLE) {
+        if (storage.cfg.travelTime > 0) {
+            long rem = ((storage.cfg.travelTime + T_TRAVEL_OVERTIME) - (now - _moveStart) + 999) / 1000;
+            return "Travel Timeout in " + String(rem > 0 ? rem : 0) + "s";
+        }
+    }
+
+    if (_relayPhase == RelayPhase::PRE_BLINK && _relayTimer > 0) {
+        long rem = (storage.cfg.preBlinkDelay - (now - _relayTimer) + 999) / 1000;
+        return "Starting in " + String(rem > 0 ? rem : 0) + "s";
+    }
+    if (acTimer > 0) {
+        long rem = (storage.cfg.acDelay - (now - acTimer) + 999) / 1000;
+        return "Auto-closing in " + String(rem > 0 ? rem : 0) + "s";
+    }
+    if (_openTimer > 0) {
+        long rem = (storage.cfg.acOpenDelay - (now - _openTimer) + 999) / 1000;
+        return "Auto-closing in " + String(rem > 0 ? rem : 0) + "s";
+    }
+    return "Idle";
+}
+
+bool Motor::hasActiveTimer() const
+{
+    if (holdOpen) return false;
+    if (calState != CalState::INACTIVE) return true;
+    if (state != MotorState::IDLE && _relayPhase == RelayPhase::IDLE && storage.cfg.travelTime > 0) return true;
+    if (_relayPhase == RelayPhase::PRE_BLINK && _relayTimer > 0) return true;
+    if (acTimer > 0 || _openTimer > 0) return true;
+    return false;
 }

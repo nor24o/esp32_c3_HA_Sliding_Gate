@@ -26,6 +26,7 @@ private:
     WiFiClient _wifiClient;   // 1st
     HADevice   _device;       // 2nd
     HAMqtt     _mqtt;         // 3rd
+    byte       _mac[6];       // Persistent MAC array for HA
 
 public:
     GateNetwork();
@@ -45,6 +46,7 @@ public:
     HAButton btnCalibrate;
     HAButton btnCancelCal;
     HAButton btnPed;
+    HASwitch swHoldOpen;
     HANumber pedWidth;
 
 private:
@@ -69,6 +71,9 @@ private:
     bool          _portalReq = false;
     unsigned long _wifiCheck = 0;
     int           _tick      = 0;
+    
+    RFLearnState  _lastRfState = RFLearnState::INACTIVE;
+    unsigned long _rfStateMs   = 0;
 
     // Web
     void _startWebServer();
@@ -87,6 +92,7 @@ private:
     // HA static callbacks
     static void _onCover (HACover::CoverCommand cmd, HACover *s);
     static void _onButton(HAButton *s);
+    static void _onSwitch(bool state, HASwitch *s);
     static void _onPedWidth(HANumeric n, HANumber *s);
 };
 

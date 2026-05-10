@@ -49,15 +49,14 @@ static Button2 btnMain, btnMaint, btnWifi, btnPed;
 // ─────────────────────────────────────────────────────────────────────────────
 // Button callbacks — post to cmdQueue from any task safely
 // ─────────────────────────────────────────────────────────────────────────────
-static void onMainClick (Button2 &btn) { Command m={CMD_TOGGLE};                              xQueueSend(cmdQueue,&m,0); }
-static void onMainLong  (Button2 &btn) { Command m={CMD_REVERSE};                             xQueueSend(cmdQueue,&m,0); }
-static void onMaintClick(Button2 &btn) { Command m={CMD_RF_LEARN_SKIP};                       xQueueSend(cmdQueue,&m,0); }
-static void onMaintLong (Button2 &btn) { Command m={CMD_RF_LEARN_SAVE_EXIT};                  xQueueSend(cmdQueue,&m,0); }
-static void onWifiLong  (Button2 &btn) { Command m={CMD_WIFI_CONFIG_START};                   xQueueSend(cmdQueue,&m,0); }
+static void onMainClick (Button2 &btn) { Command m={CMD_TOGGLE};                              xQueueSend(cmdQueue,&m,pdMS_TO_TICKS(10)); }
+static void onMainLong  (Button2 &btn) { Command m={CMD_REVERSE};                             xQueueSend(cmdQueue,&m,pdMS_TO_TICKS(10)); }
+static void onMaintClick(Button2 &btn) { Command m={CMD_RF_LEARN_SKIP};                       xQueueSend(cmdQueue,&m,pdMS_TO_TICKS(10)); }
+static void onMaintLong (Button2 &btn) { Command m={CMD_RF_LEARN_SAVE_EXIT};                  xQueueSend(cmdQueue,&m,pdMS_TO_TICKS(10)); }
+static void onWifiLong  (Button2 &btn) { Command m={CMD_WIFI_CONFIG_START};                   xQueueSend(cmdQueue,&m,pdMS_TO_TICKS(10)); }
 static void onPedClick  (Button2 &btn) {
-    const float t = float(storage.cfg.pedPercent) / 100.0f;
-    Command m = { CMD_MOVE_TO_POSITION, t, 0, 0 };
-    xQueueSend(cmdQueue, &m, 0);
+    Command m = { CMD_TOGGLE_PEDESTRIAN, 0, 0, 0 };
+    xQueueSend(cmdQueue, &m, pdMS_TO_TICKS(10));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,7 +110,12 @@ static void taskLogic(void *)
         if (HW_WDT_ENABLED) esp_task_wdt_reset();
 
         if (xQueueReceive(cmdQueue, &msg, pdMS_TO_TICKS(100)) != pdPASS) continue;
-        if (xSemaphoreTake(stateMtx, pdMS_TO_TICKS(10))       != pdTRUE) continue;
+        
+        // Wait patiently for the state mutex without silently dropping the button press!
+        while (xSemaphoreTake(stateMtx, pdMS_TO_TICKS(100)) != pdTRUE) {
+            wdtLogic = millis();
+            if (HW_WDT_ENABLED) esp_task_wdt_reset();
+        }
 
         switch (msg.cmd) {
         // ── Always-handled commands ──────────────────────────────────────────
@@ -137,9 +141,8 @@ static void taskLogic(void *)
             break;
 
         case CMD_RF_SCAN_MODE:
-            rf.learnState  = msg.aux == 1 ? RFLearnState::SCANNING_WEB
-                                           : RFLearnState::INACTIVE;
-            rf.scannedCode = 0;
+            if (msg.aux == 1) rf.startWebScan();
+            else              rf.stopWebScan();
             break;
 
         case CMD_CALIBRATE_CANCEL:
@@ -149,6 +152,15 @@ static void taskLogic(void *)
         case CMD_REBOOT:
             vTaskDelay(pdMS_TO_TICKS(500)); // allow final network packets to leave
             ESP.restart();
+            break;
+
+        case CMD_TOGGLE_PEDESTRIAN:
+            motor.togglePedestrian();
+            break;
+
+        case CMD_SET_HOLD_OPEN:
+            motor.holdOpen = (msg.aux == 1);
+            gateNet.requestUpdate();
             break;
 
         // ── Motion commands — gate must be idle and not in learn mode ────────
@@ -163,9 +175,11 @@ static void taskLogic(void *)
 
                 case CMD_TOGGLE:
                     if      (motor.state  != MotorState::IDLE)         motor.stop(true);
-                    else if (motor.lastDir == MotorState::OPENING)     motor.open();
-                    else if (motor.lastDir == MotorState::CLOSING)     motor.close();
-                    else if (motor.position >= 0.99f)                  motor.close();
+                    else if (motor.openLimit())                        motor.close();
+                    else if (motor.closeLimit())                       motor.open();
+                    else if (motor.lastDir == MotorState::OPENING)     motor.close();
+                    else if (motor.lastDir == MotorState::CLOSING)     motor.open();
+                    else if (motor.position >= 0.95f)                  motor.close();
                     else                                               motor.open();
                     break;
 
@@ -209,12 +223,13 @@ static void taskRF(void *)
 {
     if (HW_WDT_ENABLED) esp_task_wdt_add(NULL);
     for (;;) {
-        if (HW_WDT_ENABLED) esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(5)); // Poll faster to catch short RF bursts
-        if (xSemaphoreTake(stateMtx, pdMS_TO_TICKS(5)) == pdTRUE) {
-            rf.tick();
-            xSemaphoreGive(stateMtx);
+        while (xSemaphoreTake(stateMtx, pdMS_TO_TICKS(100)) != pdTRUE) {
+            if (HW_WDT_ENABLED) esp_task_wdt_reset();
         }
+        rf.tick();
+        xSemaphoreGive(stateMtx);
+        if (HW_WDT_ENABLED) esp_task_wdt_reset();
     }
 }
 
@@ -317,28 +332,31 @@ void setup()
     }
 
     motor.begin();
+    pinMode(PIN_RF_RX, INPUT); // Explicitly configure GPIO matrix before attaching interrupt
     rf.begin();
     gateNet.begin();
 
-    pinMode(PIN_RF_RX, INPUT);
-
     // Button configuration
     btnMain.begin(PIN_BTN_MAIN,  INPUT_PULLUP, true);
-    btnMain.setReleasedHandler(onMainClick);
+    btnMain.setDebounceTime(50);
+    btnMain.setPressedHandler(onMainClick); // Instantaneous reaction!
     btnMain.setLongClickHandler(onMainLong);
     btnMain.setLongClickTime(T_REVERSE_PRESS);
 
     btnMaint.begin(PIN_BTN_MAINT, INPUT_PULLUP, true);
-    btnMaint.setReleasedHandler(onMaintClick);
+    btnMaint.setDebounceTime(50);
+    btnMaint.setPressedHandler(onMaintClick); // Instantaneous reaction!
     btnMaint.setLongClickHandler(onMaintLong);
     btnMaint.setLongClickTime(T_CAL_LONG_PRESS);
 
     btnWifi.begin(PIN_BTN_WIFI, INPUT_PULLUP, true);
+    btnWifi.setDebounceTime(50);
     btnWifi.setLongClickHandler(onWifiLong);
     btnWifi.setLongClickTime(T_WIFI_LONG_PRESS);
 
     btnPed.begin(PIN_BTN_PED, INPUT_PULLUP, true);
-    btnPed.setReleasedHandler(onPedClick);
+    btnPed.setDebounceTime(50);
+    btnPed.setPressedHandler(onPedClick); // Instantaneous reaction!
     btnPed.setLongClickTime(T_PED_PRESS);
 
     rf.setMaintButton(&btnMaint);

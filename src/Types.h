@@ -35,6 +35,8 @@ enum GateCommand : uint8_t {
     CMD_MOVE_TO_POSITION,
     CMD_WIFI_CONFIG_START,
     CMD_REBOOT,
+    CMD_TOGGLE_PEDESTRIAN,
+    CMD_SET_HOLD_OPEN,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

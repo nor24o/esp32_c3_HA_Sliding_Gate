@@ -27,6 +27,7 @@ public:
     unsigned long blinkMs   = 0;              ///< 0 = LED off, >0 = period in ms
 
     bool          autoClose = false;          ///< armed after barrier reversal
+    bool          holdOpen  = false;          ///< overrides all auto-close timers
     unsigned long acTimer   = 0;              ///< millis() when auto-close arm started
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -37,6 +38,7 @@ public:
     void close();
     void stop(bool userTriggered);
     void moveTo(float target);
+    void togglePedestrian();
     void startCalibration();
     void cancelCalibration();
 
@@ -53,6 +55,10 @@ public:
 
     // ── Diagnostics ──────────────────────────────────────────────────────────
     void printIO();
+
+    // ── Timers Info ──────────────────────────────────────────────────────────
+    String getTimerStatus() const;
+    bool   hasActiveTimer() const;
 
 private:
     // Motion bookkeeping

@@ -7,7 +7,7 @@
   <style>
     :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --accent: #3b82f6; --danger: #ef4444; --success: #10b981; --gray: #64748b;}
     body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 20px; text-align: center; margin: 0; }
-    .card { background: var(--card); border-radius: 12px; padding: 20px; max-width: 450px; margin: 0 auto 20px auto; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    .card { background: var(--card); border-radius: 12px; padding: 20px; max-width: 500px; margin: 0 auto 20px auto; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
     h2 { margin-top: 0; color: var(--text); }
     button { background: var(--accent); color: white; border: none; padding: 12px 20px; font-size: 16px; border-radius: 8px; cursor: pointer; margin: 5px; font-weight: bold; transition: opacity 0.2s;}
     button.stop { background: var(--gray); }
@@ -36,8 +36,16 @@
     
     input[type="text"], input[type="number"], input[type="password"] { width: 100%; padding: 10px; margin: 5px 0 15px; border-radius: 6px; box-sizing: border-box; background: #334155; border: 1px solid #475569; color: white; }
     label { font-size: 14px; color: #cbd5e1; display: block; margin-top: 5px; text-align: left; }
-    .radio-label { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: #f8fafc; font-size: 15px; cursor: pointer; }
+    .radio-label { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px; color: #f8fafc; font-size: 15px; cursor: pointer; text-align: left; }
     hr { border: none; border-top: 1px solid #475569; margin: 20px 0; }
+    
+    /* Toggle switch styling */
+    .switch { position: relative; display: inline-block; width: 42px; height: 22px; margin-top: 2px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider-toggle { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: var(--gray); transition: .3s; border-radius: 22px; }
+    .slider-toggle:before { position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+    input:checked + .slider-toggle { background-color: var(--accent); }
+    input:checked + .slider-toggle:before { transform: translateX(20px); }
   </style>
 </head>
 <body>
@@ -53,10 +61,17 @@
   <div class="card">
     <h2>Control</h2>
     <div class="status" id="gateState">...</div>
+    <div id="timerStatusContainer" style="display: none; font-size: 14px; font-weight: bold; color: var(--accent); margin-top: -10px; margin-bottom: 15px;">
+      Next Action: <span id="timerStatusVal" style="color: var(--text);">Idle</span>
+    </div>
     <div class="controls">
       <button onclick="sendCmd('OPEN')" class="success">OPEN</button>
       <button onclick="sendCmd('STOP')" class="stop">STOP</button>
       <button onclick="sendCmd('CLOSE')" class="danger">CLOSE</button>
+    </div>
+    <div class="controls" style="margin-top: 10px;">
+      <button onclick="sendCmd('PEDESTRIAN')" style="background: var(--gray);">🚶 Pedestrian</button>
+      <button id="btnHold" onclick="toggleHold()" style="background: var(--gray);">🔓 Hold Open: OFF</button>
     </div>
     <div class="slider-container">
       <label>Set Position: <span id="posValue" style="float: right; font-weight: bold; color: var(--accent);">0%</span></label>
@@ -65,6 +80,7 @@
     <div class="slider-container" style="margin-bottom: 0;">
       <label>Pedestrian Width: <span id="pedValue" style="float: right;">30%</span></label>
     </div>
+    <button id="btnToggleTimers" onclick="toggleTimers()" style="width: 100%; margin: 15px 0 0 0; background: #334155; border: 1px solid #475569; color: var(--gray);">⏱️ Show Timers</button>
   </div>
 
   <div class="card">
@@ -99,6 +115,9 @@
 
   <div class="card links">
     <h2>System & Logs</h2>
+    <div class="sensor-row" style="background: transparent; border: none; padding: 0 0 10px 0; font-size: 14px; color: var(--gray);">
+      <span>System Uptime:</span> <span id="uptimeVal">0d 0h 0m 0s</span>
+    </div>
     <div style="display: flex; gap: 10px;">
       <button onclick="sendCmd('CALIBRATE')" style="flex: 1; margin: 0;">Calibrate</button>
       <button onclick="sendCmd('CALIBRATE_CANCEL')" class="danger" style="flex: 1; margin: 0;">Cancel</button>
@@ -119,28 +138,47 @@
     <div class="card" style="text-align: left;">
       <h2 style="text-align: center;">⚙️ System Configuration</h2>
       <form id="configForm" onsubmit="saveSettings(event)">
-          <h3>Motor Mode</h3>
-          <label class="radio-label"><input type="radio" name="motor_mode" value="1"> Mode 1: Relay 1 (Dir) + Relay 2 (Power)</label>
-          <label class="radio-label"><input type="radio" name="motor_mode" value="2"> Mode 2: Relay 1 (Open) + Relay 2 (Close)</label>
+          
+          <div style="background: #334155; padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+            <h3 style="margin-top: 0;">⚡ Motor Wiring Mode</h3>
+            <label class="radio-label">
+                <input type="radio" name="motor_mode" value="1" style="margin-top: 4px;"> 
+                <div><b>Mode 1: DIR + PWR</b><br><span style="font-size:12px; color:var(--gray);">Relay 1 sets direction, Relay 2 applies power. Standard for most single-phase boards.</span></div>
+            </label>
+            <label class="radio-label">
+                <input type="radio" name="motor_mode" value="2" style="margin-top: 4px;"> 
+                <div><b>Mode 2: OPEN + CLOSE</b><br><span style="font-size:12px; color:var(--gray);">Relay 1 opens, Relay 2 closes. Standard for dual-relay interlocking boards.</span></div>
+            </label>
+          </div>
+
+          <h3>⏱️ Timing & Logic</h3>
+          <label>Relay Switch Delay (ms) <span style="font-size:11px; color:var(--gray);">(Protects gears. Default: 700)</span></label> <input type="number" name="mdd">
+          <label>Max Travel Time (ms) <span style="font-size:11px; color:var(--gray);">(Auto-set by Calibration)</span></label>    <input type="number" name="tt">
+          <label>RF Debounce (ms) <span style="font-size:11px; color:var(--gray);">(Prevents double-clicks. Default: 400)</span></label>        <input type="number" name="rfd">
+          <label>Pre-Blink Warning Delay (ms) <span style="font-size:11px; color:var(--gray);">(0 = Disabled)</span></label> <input type="number" name="p_bd">
+          
           <hr>
-          <h3>Timing & Logic</h3>
-          <label>Relay Switch Delay (ms):</label> <input type="number" name="mdd">
-          <label>Max Travel Time (ms):</label>    <input type="number" name="tt">
-          <label>RF Debounce (ms):</label>        <input type="number" name="rfd">
-          <label>Pre-Blink Warning Delay (ms):</label> <input type="number" name="p_bd">
-          <label class="radio-label"><input type="checkbox" name="ac_opn"> Auto-Close when Fully Open</label>
-          <label>Fully Open Auto-Close Time (ms):</label> <input type="number" name="ac_od">
-          <label class="radio-label"><input type="checkbox" name="ac_bar"> Auto-Close after Barrier Clear</label>
-          <label>Barrier Auto-Close Delay (ms):</label>   <input type="number" name="acd">
-          <label class="radio-label"><input type="checkbox" name="bh"> Invert Photo Barrier (Active High)</label>
-          <label class="radio-label"><input type="checkbox" name="lh"> Invert Limit Switches (Active High)</label>
+          <h3>🚪 Auto-Close Features</h3>
+          <label class="radio-label"><label class="switch"><input type="checkbox" name="ac_opn"><span class="slider-toggle"></span></label> <div><b>Close when Fully Open</b><br><span style="font-size:12px; color:var(--gray);">Gate will automatically close when it reaches 100% position.</span></div></label>
+          <label>Fully Open Auto-Close Time (ms):</label> <input type="number" name="ac_od" placeholder="e.g. 30000 for 30s">
+          
+          <label class="radio-label" style="margin-top: 15px;"><label class="switch"><input type="checkbox" name="ac_bar"><span class="slider-toggle"></span></label> <div><b>Close after Barrier Clear</b><br><span style="font-size:12px; color:var(--gray);">Gate will close shortly after an obstacle is removed.</span></div></label>
+          <label>Barrier Auto-Close Delay (ms):</label>   <input type="number" name="acd" placeholder="e.g. 5000 for 5s">
+          
           <hr>
-          <h3>MQTT Setup</h3>
+          <h3>🛡️ Hardware Sensor Polarity</h3>
+          <label class="radio-label"><label class="switch"><input type="checkbox" name="bh"><span class="slider-toggle"></span></label> <div><b>Invert Photo Barrier</b><br><span style="font-size:12px; color:var(--gray);">Check this if your barrier uses Normally Open (N.O.) wiring.</span></div></label>
+          <label class="radio-label"><label class="switch"><input type="checkbox" name="lh"><span class="slider-toggle"></span></label> <div><b>Invert Limit Switches</b><br><span style="font-size:12px; color:var(--gray);">Check this if your limit switches use Normally Open (N.O.) wiring.</span></div></label>
+          
+          <hr>
+          <h3>🌐 MQTT Setup <span style="font-size:12px; color:var(--danger); font-weight:normal;">(Requires Reboot)</span></h3>
           <label>Host IP</label>   <input type="text" name="mq_ip">
           <label>Port</label>      <input type="text" name="mq_pt">
           <label>Username</label>  <input type="text" name="mq_us">
           <label>Password</label>  <input type="password" name="mq_pw">
-          <button type="submit" style="width: 100%; margin: 15px 0 0 0;" class="success">Save Settings</button>
+          
+          <button type="submit" id="saveBtn" style="width: 100%; margin: 15px 0 0 0;" class="success">💾 Save Settings</button>
+          <div style="font-size: 12px; color: var(--success); text-align: center; margin-top: 10px;">Settings apply instantly without rebooting!</div>
       </form>
     </div>
     <div class="card">
@@ -164,6 +202,20 @@
         ws.onmessage = handleMessage;
     }
     connectEvents();
+
+    let isHoldOpen = false;
+    function toggleHold() {
+        sendCmd(`HOLD:${isHoldOpen ? 0 : 1}`);
+    }
+
+    let showTimers = false;
+    function toggleTimers() {
+        showTimers = !showTimers;
+        document.getElementById('timerStatusContainer').style.display = showTimers ? 'block' : 'none';
+        const btnT = document.getElementById('btnToggleTimers');
+        btnT.innerText = showTimers ? '⏱️ Hide Timers' : '⏱️ Show Timers';
+        btnT.style.color = showTimers ? 'white' : 'var(--gray)';
+    }
 
     function switchTab(tabId) {
         document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
@@ -195,8 +247,16 @@
 
     function saveSettings(e) {
         e.preventDefault();
+        const btn = document.getElementById('saveBtn');
+        btn.innerText = "⏳ Saving...";
         fetch('/save', { method: 'POST', body: new FormData(e.target) })
-        .then(r => r.text()).then(msg => { alert(msg); switchTab('dashboard'); });
+        .then(r => r.json()).then(d => { 
+            btn.innerText = "✅ " + d.msg;
+            setTimeout(() => { btn.innerText = "💾 Save Settings"; switchTab('dashboard'); }, 1500);
+        }).catch(err => {
+            btn.innerText = "✅ Saved successfully!";
+            setTimeout(() => { btn.innerText = "💾 Save Settings"; switchTab('dashboard'); }, 1500);
+        });
     }
 
     function handleMessage(e) {
@@ -213,6 +273,30 @@
         document.getElementById('barrier').innerText = d.pb === 0 ? "🔴 BLOCKED" : "🟢 CLEAR";
         document.getElementById('lastRf').innerText = d.rf;
         document.getElementById('mqttStatus').innerText = d.mq === 1 ? "🟢 Connected" : "🔴 Disconnected";
+        
+        if (d.ts !== undefined) {
+            document.getElementById('timerStatusVal').innerText = d.ts;
+        }
+        
+        if (d.up !== undefined) {
+            const dd = Math.floor(d.up / 86400);
+            const hh = Math.floor((d.up % 86400) / 3600);
+            const mm = Math.floor((d.up % 3600) / 60);
+            const ss = d.up % 60;
+            document.getElementById('uptimeVal').innerText = `${dd}d ${hh}h ${mm}m ${ss}s`;
+        }
+
+        if (d.ho !== undefined) {
+            isHoldOpen = (d.ho === 1);
+            const btnH = document.getElementById('btnHold');
+            if (isHoldOpen) {
+                btnH.style.background = 'var(--accent)';
+                btnH.innerText = '🔒 Hold Open: ON';
+            } else {
+                btnH.style.background = 'var(--gray)';
+                btnH.innerText = '🔓 Hold Open: OFF';
+            }
+        }
 
         if (scanning && d.s === 'SCANNING' && d.ss !== 'Waiting...') {
             lastScanned = d.ss;

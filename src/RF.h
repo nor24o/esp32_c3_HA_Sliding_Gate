@@ -32,6 +32,8 @@ public:
     void tick();   ///< called from vRFTask — polls RCSwitch
 
     void startLearning();
+    void startWebScan();
+    void stopWebScan();
     void setMaintButton(Button2 *btn);
 
     void addKey(unsigned long code, uint8_t func);

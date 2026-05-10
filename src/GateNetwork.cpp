@@ -11,6 +11,7 @@
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <Update.h>
+#include <esp_timer.h>
 
 GateNetwork gateNet;
 WiFiClient  telnetClient;
@@ -31,6 +32,7 @@ GateNetwork::GateNetwork()
     , btnOpen("gate_btn_open"),     btnClose("gate_btn_close")
     , btnStop("gate_btn_stop"),     btnCalibrate("gate_btn_cal")
     , btnCancelCal("gate_btn_cal_cancel"), btnPed("gate_btn_ped")
+    , swHoldOpen("gate_hold_open")
     , pedWidth("gate_ped_width")
     , _server(80)
     , _ws("/ws")
@@ -42,8 +44,6 @@ GateNetwork::GateNetwork()
     , _sLimOpen("gate_lim_open"),   _sLimClose("gate_lim_close")
     , _sBarrier("gate_barrier")
 {
-    byte mac[6]; WiFi.macAddress(mac);
-    _device.setUniqueId(mac, sizeof(mac));
     _device.setName("Sliding Gate");
     _device.setModel("ESP32-C3");
     _device.setManufacturer("H_N");
@@ -61,6 +61,10 @@ GateNetwork::GateNetwork()
     btn(btnCalibrate, "Calibrate",   "mdi:ruler");
     btn(btnCancelCal, "Cancel Cal",  "mdi:cancel");
     btn(btnPed,       "Pedestrian",  "mdi:walk");
+
+    swHoldOpen.setName("Hold Open (Party Mode)");
+    swHoldOpen.setIcon("mdi:lock-open-variant");
+    swHoldOpen.onCommand(_onSwitch);
 
     pedWidth.setName("Pedestrian Width %");
     pedWidth.setIcon("mdi:arrow-expand-horizontal");
@@ -85,6 +89,9 @@ GateNetwork::GateNetwork()
 void GateNetwork::begin()
 {
     wifiWrapperBegin();
+
+    WiFi.macAddress(_mac);
+    _device.setUniqueId(_mac, sizeof(_mac));
 
     _device.enableSharedAvailability();
     _mqtt.begin(storage.cfg.mqttHost,
@@ -114,7 +121,12 @@ void GateNetwork::_onButton(HAButton *s)
     else if (s == &n.btnCalibrate) postCmd(CMD_CALIBRATE_START);
     else if (s == &n.btnCancelCal) postCmd(CMD_CALIBRATE_CANCEL);
     else if (s == &n.btnPed)
-        postCmd(CMD_MOVE_TO_POSITION, float(storage.cfg.pedPercent) / 100.0f);
+        postCmd(CMD_TOGGLE_PEDESTRIAN);
+}
+
+void GateNetwork::_onSwitch(bool state, HASwitch *s)
+{
+    if (s == &gateNet.swHoldOpen) postCmd(CMD_SET_HOLD_OPEN, -1.0f, 0, state ? 1 : 0);
 }
 
 void GateNetwork::_onPedWidth(HANumeric n, HANumber *s)
@@ -151,17 +163,26 @@ void GateNetwork::broadcastStatus()
             sub = rf.scannedCode ? String(rf.scannedCode) : String("Waiting…");
         }
 
-        char json[256];
+        String ts = motor.getTimerStatus();
+        if (rf.learnState != RFLearnState::INACTIVE) {
+            long rem = (T_RF_LEARN_TIMEOUT - (millis() - _rfStateMs) + 999) / 1000;
+            ts = "RF Timeout in " + String(rem > 0 ? rem : 0) + "s";
+        }
+
+        char json[384];
         snprintf(json, sizeof(json),
-                 "{\"type\":\"status\",\"s\":\"%s\",\"ss\":\"%s\",\"p\":%d,"
-                 "\"lo\":%d,\"lc\":%d,\"pb\":%d,\"rf\":%lu,\"pw\":%d,\"mq\":%d}",
+                 "{\"type\":\"status\",\"s\":\"%s\",\"ss\":\"%s\",\"p\":%d,\"lo\":%d,"
+                 "\"lc\":%d,\"pb\":%d,\"rf\":%lu,\"pw\":%d,\"mq\":%d,\"ho\":%d,\"ts\":\"%s\",\"up\":%lu}",
                  st, sub.c_str(),
                  int(motor.position * 100),
                  motor.openLimit()        ? 0 : 1,
                  motor.closeLimit()       ? 0 : 1,
                  motor.barrierTriggered() ? 0 : 1,
                  rf.lastCode, storage.cfg.pedPercent,
-                 _mqtt.isConnected()      ? 1 : 0);
+                 _mqtt.isConnected()      ? 1 : 0,
+                 motor.holdOpen           ? 1 : 0,
+                 ts.c_str(),
+                 (unsigned long)(esp_timer_get_time() / 1000000ULL));
         _ws.textAll(json);
     }
 
@@ -184,6 +205,7 @@ void GateNetwork::broadcastStatus()
     _sLimOpen.setState(motor.openLimit());
     _sLimClose.setState(motor.closeLimit());
     _sBarrier.setState(motor.barrierTriggered());
+    swHoldOpen.setState(motor.holdOpen);
 
     char code[20]; snprintf(code, sizeof(code), "%lu", rf.lastCode);
     _sLastRF.setValue(code);
@@ -237,6 +259,10 @@ void GateNetwork::_handleWsText(const String &t)
     else if (t == "WIFI_CONFIG")      startWifiPortal();
     else if (t == "SCAN_START")       postCmd(CMD_RF_SCAN_MODE, -1, 0, 1);
     else if (t == "SCAN_STOP")        postCmd(CMD_RF_SCAN_MODE, -1, 0, 0);
+    else if (t == "PEDESTRIAN")       postCmd(CMD_TOGGLE_PEDESTRIAN);
+    else if (t.startsWith("HOLD:")) {
+        postCmd(CMD_SET_HOLD_OPEN, -1.0f, 0, t.substring(5).toInt());
+    }
     else if (t.startsWith("ADD:")) {
         const int a = t.indexOf(':'), b = t.lastIndexOf(':');
         if (a > 0 && b > a)
@@ -298,7 +324,7 @@ void GateNetwork::_handleSave(AsyncWebServerRequest *req)
     if (req->hasArg("motor_mode")) c.motorMode = req->arg("motor_mode").toInt();
     storage.save();
 
-    req->send(200, "text/plain", "Settings saved successfully!\n\n(Note: Changes to motor timings take effect immediately. Changes to MQTT require a reboot).");
+    req->send(200, "application/json", "{\"status\":\"ok\",\"msg\":\"Saved! Applied instantly.\"}");
 }
 
 void GateNetwork::_handleLogs(AsyncWebServerRequest *req)
@@ -421,9 +447,17 @@ void GateNetwork::loop()
         if (WiFi.status() != WL_CONNECTED) LOG_PRINTLN("[Net] WiFi reconnecting…");
     }
 
+    // Track when RF state changes to calculate timeout accurately
+    if (rf.learnState != _lastRfState) {
+        if (rf.learnState != RFLearnState::INACTIVE) _rfStateMs = millis();
+        _lastRfState = rf.learnState;
+    }
+
     // Adaptive broadcast rate: fast while moving, slow while idle
     const bool busy = (motor.state != MotorState::IDLE ||
-                       motor.calState != CalState::INACTIVE);
+                       motor.calState != CalState::INACTIVE ||
+                       motor.hasActiveTimer() ||
+                       rf.learnState != RFLearnState::INACTIVE);
     const int  rate = busy ? 10 : 120;   // ticks at 25 ms each → 250 ms / 3 s
 
     if (_update || ++_tick >= rate) {

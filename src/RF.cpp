@@ -12,8 +12,8 @@ RF rf;
 
 void RF::begin()
 {
-    _sw.setReceiveTolerance(90); // Increase timing tolerance to survive ESP32 WiFi jitter
-    _sw.enableReceive(digitalPinToInterrupt(PIN_RF_RX));
+    _sw.enableReceive(PIN_RF_RX);
+    storage.log("[RF] RCSwitch Hardware Receiver initialized on Pin " + String(PIN_RF_RX));
 }
 
 void RF::setMaintButton(Button2 *btn)
@@ -46,6 +46,21 @@ void RF::startLearning()
     storage.log("[RF] Learn mode started.");
 }
 
+void RF::startWebScan()
+{
+    learnState  = RFLearnState::SCANNING_WEB;
+    _learnStart = millis(); // Reset the 60-second timeout!
+    scannedCode = 0;
+    storage.log("[RF] Web scan started.");
+}
+
+void RF::stopWebScan()
+{
+    learnState  = RFLearnState::INACTIVE;
+    scannedCode = 0;
+    storage.log("[RF] Web scan stopped.");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // tick() — called from vRFTask
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,9 +78,16 @@ void RF::tick()
     }
 
     if (!_sw.available()) return;
+    
     const unsigned long code = _sw.getReceivedValue();
+    const unsigned int bitlength = _sw.getReceivedBitlength();
+    const unsigned int protocol = _sw.getReceivedProtocol();
     _sw.resetAvailable();
+    
     if (code == 0) return;
+
+    // Dump the raw signal to the console!
+    LOG_PRINTF("[RF DEBUG] Raw Code: %lu | Bits: %u | Protocol: %u\n", code, bitlength, protocol);
 
     if (learnState != RFLearnState::INACTIVE)
         _onLearning(code);
@@ -97,8 +119,7 @@ void RF::_onSignal(unsigned long code)
         case 0: _dispatch(CMD_OPEN);      break;
         case 1: _dispatch(CMD_CLOSE);     break;
         case 2: _dispatch(CMD_STOP_ONLY); break;
-        case 3: _dispatch(CMD_MOVE_TO_POSITION,
-                          float(storage.cfg.pedPercent) / 100.0f); break;
+        case 3: _dispatch(CMD_TOGGLE_PEDESTRIAN); break;
         case 4: _dispatch(CMD_TOGGLE);    break;
         }
         return;
