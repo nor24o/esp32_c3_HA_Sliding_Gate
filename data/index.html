@@ -1,133 +1,262 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Gate Control</title>
-    <meta name='viewport' content='width=device-width, initial-scale=1'>
-    <style>
-        body{font-family:sans-serif;margin:10px;text-align:center;background:#f4f4f4}
-        .card{background:white;padding:15px;border-radius:10px;box-shadow:0 2px 5px rgba(0,0,0,0.1);max-width:500px;margin:10px auto}
-        .btn{display:inline-block;padding:12px;color:white;text-decoration:none;border-radius:5px;margin:5px;font-weight:bold;cursor:pointer;border:none;font-size:16px;width:30%}
-        .grn{background:#28a745}.red{background:#dc3545}.gry{background:#6c757d}.blu{background:#007bff}
-        .sensor-row{display:flex;justify-content:space-between;padding:8px;background:#eee;border-bottom:1px solid #ddd}
-        table{width:100%;border-collapse:collapse;margin-top:10px} 
-        th,td{border:1px solid #ddd;padding:8px}
-        textarea{width:100%;height:100px;font-family:monospace;font-size:12px;margin-bottom:10px}
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Gate Dashboard</title>
+  <style>
+    :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --accent: #3b82f6; --danger: #ef4444; --success: #10b981; --gray: #64748b;}
+    body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 20px; text-align: center; margin: 0; }
+    .card { background: var(--card); border-radius: 12px; padding: 20px; max-width: 450px; margin: 0 auto 20px auto; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    h2 { margin-top: 0; color: var(--text); }
+    button { background: var(--accent); color: white; border: none; padding: 12px 20px; font-size: 16px; border-radius: 8px; cursor: pointer; margin: 5px; font-weight: bold; transition: opacity 0.2s;}
+    button.stop { background: var(--gray); }
+    button.danger { background: var(--danger); }
+    button.success { background: var(--success); }
+    button:active { opacity: 0.8; }
+    .controls { display: flex; justify-content: space-between; }
+    .controls button { flex: 1; }
+    .status { font-size: 22px; font-weight: bold; margin: 15px 0; color: var(--success); }
+    .slider-container { margin: 20px 0; text-align: left;}
+    .slider { width: 100%; accent-color: var(--accent); margin-top: 10px; cursor: pointer;}
+    .sensor-row { display: flex; justify-content: space-between; padding: 10px; background: #334155; margin-bottom: 5px; border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+    th, td { border: 1px solid #475569; padding: 8px; text-align: center; }
+    th { background: #334155; }
+    .links { display: flex; flex-direction: column; gap: 10px; }
+    .links a, .links button { width: 100%; text-decoration: none; box-sizing: border-box;}
+    select { padding: 10px; border-radius: 6px; background: #334155; color: white; border: 1px solid #475569; width: 100%; margin-bottom: 10px;}
+    textarea { width: 100%; height: 120px; font-family: monospace; font-size: 12px; background: #0f172a; color: #10b981; border: 1px solid #475569; padding: 8px; border-radius: 6px; resize: vertical; box-sizing: border-box; }
+    
+    .nav { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; }
+    .nav button { flex: 1; max-width: 150px; background: #334155; color: var(--gray); border: 1px solid #475569; margin: 0; }
+    .nav button.active { background: var(--accent); color: white; border-color: var(--accent); }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    
+    input[type="text"], input[type="number"], input[type="password"] { width: 100%; padding: 10px; margin: 5px 0 15px; border-radius: 6px; box-sizing: border-box; background: #334155; border: 1px solid #475569; color: white; }
+    label { font-size: 14px; color: #cbd5e1; display: block; margin-top: 5px; text-align: left; }
+    .radio-label { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: #f8fafc; font-size: 15px; cursor: pointer; }
+    hr { border: none; border-top: 1px solid #475569; margin: 20px 0; }
+  </style>
 </head>
 <body>
-    <div class='card'>
-        <h1>Gate Control</h1>
-        <p>Status: <b id='status'>...</b> <span id='sub_status' style='color:#007bff'></span></p>
-        <p>Position: <b id='pos'>...</b>%</p>
-        <p style="font-size: 0.9em; color: #666;">Pedestrian Setting: <b id='ped_val'>-</b>%</p>
-        
-        <button onclick="send('OPEN')" class='btn grn'>OPEN</button>
-        <button onclick="send('STOP')" class='btn gry'>STOP</button>
-        <button onclick="send('CLOSE')" class='btn red'>CLOSE</button>
+  <h1 style="margin-top: 0;">Sliding Gate Control</h1>
+  <p id="wsStatus" style="color: var(--gray);">Connecting...</p>
+  
+  <div class="nav">
+    <button id="nav-dashboard" class="active" onclick="switchTab('dashboard')">Dashboard</button>
+    <button id="nav-settings" onclick="switchTab('settings')">Settings</button>
+  </div>
+
+  <div id="tab-dashboard" class="tab-content active">
+  <div class="card">
+    <h2>Control</h2>
+    <div class="status" id="gateState">...</div>
+    <div class="controls">
+      <button onclick="sendCmd('OPEN')" class="success">OPEN</button>
+      <button onclick="sendCmd('STOP')" class="stop">STOP</button>
+      <button onclick="sendCmd('CLOSE')" class="danger">CLOSE</button>
     </div>
-
-    <div class='card'>
-        <h3>Sensors</h3>
-        <div class='sensor-row'><span>Open Limit:</span><span id='lo_ind'>-</span></div>
-        <div class='sensor-row'><span>Close Limit:</span><span id='lc_ind'>-</span></div>
-        <div class='sensor-row'><span>Barrier:</span><span id='pb_ind'>-</span></div>
-        <div class='sensor-row'><span>Last RF:</span><b id='rf_val'>-</b></div>
+    <div class="slider-container">
+      <label>Set Position: <span id="posValue" style="float: right; font-weight: bold; color: var(--accent);">0%</span></label>
+      <input type="range" class="slider" id="posSlider" min="0" max="100" value="0" onchange="sendCmd('MOVE:' + this.value)">
     </div>
-
-    <div class='card'>
-        <h3>RF Remotes</h3>
-        <button id='scanBtn' onclick="toggleScan()" class='btn blu' style='width:90%'>Scan New Remote</button>
-        <div id='scanPanel' style='display:none;background:#e9ecef;padding:10px;margin-top:10px'>
-            <p>Press remote button...</p>
-            <b>Code: <span id='scannedCode'>Waiting...</span></b><br><br>
-            <select id='funcSel'>
-                <option value='0'>OPEN</option>
-                <option value='1'>CLOSE</option>
-                <option value='2'>STOP</option>
-                <option value='3'>PEDESTRIAN</option>
-                <option value='4'>TOGGLE</option>
-            </select>
-            <button onclick="addCode()" class='btn grn'>ADD</button>
-        </div>
-        <table id='rfTable'>
-            <thead><tr><th>Code</th><th>Func</th><th>Action</th></tr></thead>
-            <tbody></tbody>
-        </table>
+    <div class="slider-container" style="margin-bottom: 0;">
+      <label>Pedestrian Width: <span id="pedValue" style="float: right;">30%</span></label>
     </div>
+  </div>
 
-    <div class='card'>
-        <h3>System</h3>
-        <button onclick="send('CALIBRATE')" class='btn blu' style='width:45%'>Calibrate</button>
-        <button onclick="send('CALIBRATE_CANCEL')" class='btn red' style='width:45%'>Cancel</button>
-        <br><br>
-        <a href='/config'><button class='btn gry' style='width:45%'>WiFi/MQTT</button></a>
-        <br><br>
-        <button onclick="send('WIFI_CONFIG')" class='btn red' style='width:45%'>WIFI_PORTAL</button>
-        <br><br>
-        <textarea id='logArea' readonly>Loading...</textarea>
-        <button onclick='fetchLogs()' class='btn gry'>Refresh</button>
-        <button onclick='clearLogs()' class='btn red'>Clear</button>
+  <div class="card">
+    <h2>Sensors</h2>
+    <div class="sensor-row"><span>Open Limit:</span> <span id="limOpen">🔴</span></div>
+    <div class="sensor-row"><span>Close Limit:</span> <span id="limClose">🔴</span></div>
+    <div class="sensor-row"><span>Photo Barrier:</span> <span id="barrier">🟢 Clear</span></div>
+    <div class="sensor-row"><span>Last RF Code:</span> <b id="lastRf">-</b></div>
+    <div class="sensor-row"><span>Home Assistant (MQTT):</span> <span id="mqttStatus">🔴 Disconnected</span></div>
+  </div>
+
+  <div class="card">
+    <h2>RF Remotes</h2>
+    <button id="scanBtn" onclick="toggleScan()" style="width: 100%; margin: 0;">Scan New Remote</button>
+    <div id="scanPanel" style="display:none; background:#334155; padding:15px; margin-top:10px; border-radius: 8px;">
+        <p style="margin-top: 0;">Press a button on the remote...</p>
+        <h3 style="color: var(--accent); margin: 10px 0;"><span id="scannedCode">Waiting...</span></h3>
+        <select id="funcSel">
+            <option value="0">OPEN</option>
+            <option value="1">CLOSE</option>
+            <option value="2">STOP</option>
+            <option value="3">PEDESTRIAN</option>
+            <option value="4">TOGGLE</option>
+        </select>
+        <button onclick="addCode()" class="success" style="width: 100%; margin: 0;">ADD REMOTE</button>
     </div>
+    <table id="rfTable">
+        <thead><tr><th>Code</th><th>Action</th><th></th></tr></thead>
+        <tbody></tbody>
+    </table>
+  </div>
 
-    <script>
-        var ws = new WebSocket('ws://' + location.hostname + ':81/');
-        var scanning = false; 
-        var lastScanned = 0;
+  <div class="card links">
+    <h2>System & Logs</h2>
+    <div style="display: flex; gap: 10px;">
+      <button onclick="sendCmd('CALIBRATE')" style="flex: 1; margin: 0;">Calibrate</button>
+      <button onclick="sendCmd('CALIBRATE_CANCEL')" class="danger" style="flex: 1; margin: 0;">Cancel</button>
+    </div>
+    <div style="display: flex; gap: 10px;">
+        <button onclick="sendCmd('REBOOT')" style="background: var(--gray); flex: 1; margin: 0;">Reboot ESP</button>
+      <button onclick="sendCmd('WIFI_CONFIG')" class="danger" style="flex: 1; margin: 0;">WiFi Portal</button>
+    </div>
+    <textarea id="logArea" readonly>Loading logs...</textarea>
+    <div style="display: flex; gap: 10px;">
+      <button onclick="fetchLogs()" style="background: var(--gray); flex: 1; margin: 0;">Refresh Logs</button>
+      <button onclick="clearLogs()" class="danger" style="flex: 1; margin: 0;">Clear Logs</button>
+    </div>
+  </div>
+  </div>
 
-        ws.onmessage = function(e) {
-            var d = JSON.parse(e.data);
-            if(d.type === 'status') {
-                document.getElementById('status').innerHTML = d.s;
-                document.getElementById('sub_status').innerHTML = d.ss;
-                document.getElementById('pos').innerHTML = d.p;
-                // UPDATE NEW ELEMENT
-                document.getElementById('ped_val').innerHTML = d.pw; 
-                
-                document.getElementById('lo_ind').innerHTML = d.lo==0?'<b style="color:red">HIT</b>':'<span style="color:green">FREE</span>';
-                document.getElementById('lc_ind').innerHTML = d.lc==0?'<b style="color:red">HIT</b>':'<span style="color:green">FREE</span>';
-                document.getElementById('pb_ind').innerHTML = d.pb==0?'<b style="color:red">BLOCKED</b>':'<span style="color:green">CLEAR</span>';
-                document.getElementById('rf_val').innerHTML = d.rf;
-                
-                if(scanning && d.s === 'SCANNING' && d.ss !== 'Waiting...') {
-                    lastScanned = d.ss; 
-                    document.getElementById('scannedCode').innerHTML = lastScanned;
-                }
-            } else if (d.type === 'rf_list') { 
-                renderTable(d.data); 
-            }
-        };
+  <div id="tab-settings" class="tab-content">
+    <div class="card" style="text-align: left;">
+      <h2 style="text-align: center;">⚙️ System Configuration</h2>
+      <form id="configForm" onsubmit="saveSettings(event)">
+          <h3>Motor Mode</h3>
+          <label class="radio-label"><input type="radio" name="motor_mode" value="1"> Mode 1: Relay 1 (Dir) + Relay 2 (Power)</label>
+          <label class="radio-label"><input type="radio" name="motor_mode" value="2"> Mode 2: Relay 1 (Open) + Relay 2 (Close)</label>
+          <hr>
+          <h3>Timing & Logic</h3>
+          <label>Relay Switch Delay (ms):</label> <input type="number" name="mdd">
+          <label>Max Travel Time (ms):</label>    <input type="number" name="tt">
+          <label>RF Debounce (ms):</label>        <input type="number" name="rfd">
+          <label>Pre-Blink Warning Delay (ms):</label> <input type="number" name="p_bd">
+          <label class="radio-label"><input type="checkbox" name="ac_opn"> Auto-Close when Fully Open</label>
+          <label>Fully Open Auto-Close Time (ms):</label> <input type="number" name="ac_od">
+          <label class="radio-label"><input type="checkbox" name="ac_bar"> Auto-Close after Barrier Clear</label>
+          <label>Barrier Auto-Close Delay (ms):</label>   <input type="number" name="acd">
+          <label class="radio-label"><input type="checkbox" name="bh"> Invert Photo Barrier (Active High)</label>
+          <label class="radio-label"><input type="checkbox" name="lh"> Invert Limit Switches (Active High)</label>
+          <hr>
+          <h3>MQTT Setup</h3>
+          <label>Host IP</label>   <input type="text" name="mq_ip">
+          <label>Port</label>      <input type="text" name="mq_pt">
+          <label>Username</label>  <input type="text" name="mq_us">
+          <label>Password</label>  <input type="password" name="mq_pw">
+          <button type="submit" style="width: 100%; margin: 15px 0 0 0;" class="success">Save Settings</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>🔄 Firmware OTA Update</h2>
+      <form method='POST' action='/update' enctype='multipart/form-data'>
+          <input type='file' name='update' required style="margin-bottom: 15px; color: white;">
+          <button type='submit' style="width: 100%; margin: 0;" class="danger" onclick="this.innerText='Flashing... Please wait!';">Upload & Flash</button>
+      </form>
+    </div>
+  </div>
 
-        function renderTable(list) {
-            var tb = document.querySelector('#rfTable tbody'); 
-            tb.innerHTML = '';
-            var funcs = ['OPEN', 'CLOSE', 'STOP', 'PED', 'TOGGLE'];
-            list.forEach((item, idx) => {
-                tb.innerHTML += '<tr><td>'+item.c+'</td><td>'+funcs[item.f]+'</td><td><button onclick="delCode('+idx+')" style="background:red;color:white;border:none;border-radius:3px">X</button></td></tr>';
-            });
+  <script>
+    let ws = new WebSocket(`ws://${location.hostname}/ws`);
+    let scanning = false;
+    let lastScanned = 0;
+    let reconnectTimer = null;
+
+    function connectEvents() {
+        ws.onopen = () => { document.getElementById('wsStatus').innerText = 'Connected 🟢'; document.getElementById('wsStatus').style.color = 'var(--success)'; if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }};
+        ws.onclose = () => { document.getElementById('wsStatus').innerText = 'Disconnected 🔴 Reconnecting...'; document.getElementById('wsStatus').style.color = 'var(--danger)'; reconnectTimer = setTimeout(() => { ws = new WebSocket(`ws://${location.hostname}/ws`); connectEvents(); }, 3000); };
+        ws.onmessage = handleMessage;
+    }
+    connectEvents();
+
+    function switchTab(tabId) {
+        document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.nav button').forEach(b => b.classList.remove('active'));
+        document.getElementById('tab-' + tabId).classList.add('active');
+        document.getElementById('nav-' + tabId).classList.add('active');
+        if (tabId === 'settings') loadSettings();
+    }
+
+    function loadSettings() {
+        fetch('/settings').then(r => r.json()).then(d => {
+            document.querySelector(`input[name="motor_mode"][value="${d.motor_mode}"]`).checked = true;
+            document.querySelector('input[name="mdd"]').value = d.mdd;
+            document.querySelector('input[name="tt"]').value = d.tt;
+            document.querySelector('input[name="rfd"]').value = d.rfd;
+            document.querySelector('input[name="p_bd"]').value = d.p_bd;
+            document.querySelector('input[name="ac_opn"]').checked = d.ac_opn;
+            document.querySelector('input[name="ac_od"]').value = d.ac_od;
+            document.querySelector('input[name="ac_bar"]').checked = d.ac_bar;
+            document.querySelector('input[name="acd"]').value = d.acd;
+            document.querySelector('input[name="bh"]').checked = d.bh;
+            document.querySelector('input[name="lh"]').checked = d.lh;
+            document.querySelector('input[name="mq_ip"]').value = d.mq_ip;
+            document.querySelector('input[name="mq_pt"]').value = d.mq_pt;
+            document.querySelector('input[name="mq_us"]').value = d.mq_us;
+            document.querySelector('input[name="mq_pw"]').value = d.mq_pw;
+        });
+    }
+
+    function saveSettings(e) {
+        e.preventDefault();
+        fetch('/save', { method: 'POST', body: new FormData(e.target) })
+        .then(r => r.text()).then(msg => { alert(msg); switchTab('dashboard'); });
+    }
+
+    function handleMessage(e) {
+      let d; try { d = JSON.parse(e.data); } catch(ex) { return; }
+      if (d.type === 'status') {
+        document.getElementById('gateState').innerText = `${d.s} ${d.ss ? '- ' + d.ss : ''} (${d.p}%)`;
+        if(document.activeElement !== document.getElementById('posSlider')) {
+           document.getElementById('posSlider').value = d.p;
         }
+        document.getElementById('posValue').innerText = d.p + '%';
+        document.getElementById('pedValue').innerText = d.pw + '%';
+        document.getElementById('limOpen').innerText = d.lo === 0 ? "🔴 HIT" : "🟢 FREE";
+        document.getElementById('limClose').innerText = d.lc === 0 ? "🔴 HIT" : "🟢 FREE";
+        document.getElementById('barrier').innerText = d.pb === 0 ? "🔴 BLOCKED" : "🟢 CLEAR";
+        document.getElementById('lastRf').innerText = d.rf;
+        document.getElementById('mqttStatus').innerText = d.mq === 1 ? "🟢 Connected" : "🔴 Disconnected";
 
-        function send(cmd) { ws.send(cmd); }
-        
-        function toggleScan() { 
-            scanning = !scanning;
-            document.getElementById('scanPanel').style.display = scanning ? 'block' : 'none';
-            document.getElementById('scanBtn').innerText = scanning ? 'Stop Scanning' : 'Scan New Remote';
-            ws.send(scanning ? 'SCAN_START' : 'SCAN_STOP'); 
+        if (scanning && d.s === 'SCANNING' && d.ss !== 'Waiting...') {
+            lastScanned = d.ss;
+            document.getElementById('scannedCode').innerText = lastScanned;
         }
+      } else if (d.type === 'rf_list') {
+          renderTable(d.data);
+      }
+    };
 
-        function addCode() { 
-            if(lastScanned != 0) { 
-                var f = document.getElementById('funcSel').value; 
-                ws.send('ADD:' + lastScanned + ':' + f); 
-                toggleScan(); 
-            } 
-        }
+    function renderTable(list) {
+        const funcs = ['OPEN','CLOSE','STOP','PEDESTRIAN','TOGGLE'];
+        const tb = document.querySelector('#rfTable tbody');
+        tb.innerHTML = '';
+        list.forEach((item, idx) => {
+            tb.innerHTML += `<tr><td>${item.c}</td><td>${funcs[item.f] || item.f}</td>
+            <td><button onclick="delCode(${idx})" class="danger" style="padding: 5px 10px; margin: 0;">✕</button></td></tr>`;
+        });
+    }
 
-        function delCode(idx) { if(confirm('Delete?')) ws.send('DEL:' + idx); }
-        function fetchLogs() { fetch('/logs').then(r => r.text()).then(t => document.getElementById('logArea').value = t); }
-        function clearLogs() { fetch('/clear_logs').then(r => fetchLogs()); }
-        
-        fetchLogs();
-    </script>
+    function sendCmd(cmd) { if(ws.readyState === WebSocket.OPEN) ws.send(cmd); }
+    document.getElementById('posSlider').oninput = function() { document.getElementById('posValue').innerText = this.value + '%'; }
+
+    function toggleScan() {
+        scanning = !scanning;
+        document.getElementById('scanPanel').style.display = scanning ? 'block' : 'none';
+        document.getElementById('scanBtn').innerText = scanning ? 'Stop Scanning' : 'Scan New Remote';
+        document.getElementById('scannedCode').innerText = 'Waiting...';
+        lastScanned = 0;
+        sendCmd(scanning ? 'SCAN_START' : 'SCAN_STOP');
+    }
+
+    function addCode() {
+        if (lastScanned === 0) return;
+        let f = document.getElementById('funcSel').value;
+        sendCmd(`ADD:${lastScanned}:${f}`);
+        toggleScan();
+    }
+
+    function delCode(idx) { if (confirm(`Delete RF entry #${idx}?`)) sendCmd(`DEL:${idx}`); }
+    function fetchLogs() { fetch('/logs').then(r => r.text()).then(t => document.getElementById('logArea').value = t); }
+    function clearLogs() { fetch('/clear_logs').then(() => fetchLogs()); }
+    
+    fetchLogs();
+  </script>
 </body>
 </html>

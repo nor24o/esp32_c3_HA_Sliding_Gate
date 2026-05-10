@@ -1,87 +1,94 @@
-#ifndef NETWORK_MANAGER_H
-#define NETWORK_MANAGER_H
+#pragma once
+/**
+ * @file  Network.h
+ * @brief WiFi, async HTTP + WebSocket server, Home Assistant MQTT integration,
+ *        Telnet debug console.
+ */
 
-#include "Definitions.h"
-#include "ConfigManager.h"
-#include "MotorController.h"
-#include "RFManager.h"
+#include "Config.h"
+#include "Types.h"
+#include "Storage.h"
+#include "Motor.h"
+#include "RF.h"
+
+#include <ESPAsyncWebServer.h>    // 2nd — skips its conflicting typedef
+#include <AsyncTCP.h>
 #include <WiFi.h>
-#include <WebServer.h>
-#include <WebSocketsServer.h>
 #include <ArduinoHA.h>
-#include <WiFiManager.h>
 #include <ESPmDNS.h>
 
-class GateNetwork {
-// ---------------------------------------------------------
-// CRITICAL: DEVICE & MQTT MUST BE DEFINED FIRST
-// ---------------------------------------------------------
-private: 
-    // They must be initialized before any Button/Sensor tries to use them
-    HADevice device;
-    HAMqtt mqtt;
+// ─────────────────────────────────────────────────────────────────────────────
+class GateNetwork
+{
+    // Construction order is critical for ArduinoHA:
+    // wifiClient must be fully constructed before mqtt references it.
+private:
+    WiFiClient _wifiClient;   // 1st
+    HADevice   _device;       // 2nd
+    HAMqtt     _mqtt;         // 3rd
 
 public:
     GateNetwork();
     void begin();
-    void loop();
-    void broadcastStatus();
-    void triggerWifiConfig();
-    void sendRFListToWeb();
-    
-    bool simCrashNetwork = false;
-    volatile bool updateRequest = false; 
+    void loop();              ///< called from vNetworkTask every 25 ms
 
-    // Public Entities (Must be defined AFTER 'device')
+    void requestUpdate() { _update = true; }   ///< force immediate broadcast
+    void startWifiPortal()   { _portalReq = true; }
+
+    void sendRFList();
+    void broadcastStatus();
+
+    // Public HA entities (must be declared after _device / _mqtt are constructed)
     HAButton btnOpen;
     HAButton btnClose;
     HAButton btnStop;
     HAButton btnCalibrate;
     HAButton btnCancelCal;
-    HAButton btnMove50;
-    HANumber pedWidthNumber; 
+    HAButton btnPed;
+    HANumber pedWidth;
 
 private:
-    WebServer server;
-    WebSocketsServer webSocket;
-    WiFiManager wm;
-    WiFiClient wifiClient;
-    WiFiServer telnetServer;
-    
-    // Other Entities
-    HACover haCover;
-    HASensor rfCodeSensor;
-    HASensor gateState;
-    HASensor gateIP;
-    HASensor travelTime;
-    HASensor gatePosition;
-    HABinarySensor limOpen;
-    HABinarySensor limClose;
-    HABinarySensor barrier;
+    // Web stack — single port 80, WebSocket at /ws
+    AsyncWebServer _server;
+    AsyncWebSocket _ws;
+    WiFiServer     _telnet;
 
+    // HA entities
+    HACover        _cover;
+    HASensor       _sLastRF;
+    HASensor       _sState;
+    HASensor       _sIP;
+    HASensor       _sTravelTime;
+    HASensor       _sPosition;
+    HABinarySensor _sLimOpen;
+    HABinarySensor _sLimClose;
+    HABinarySensor _sBarrier;
 
-    bool webServerStarted = false;
-    bool configPortalRequested = false;
-    unsigned long lastBroadcast = 0;
-    unsigned long lastWifiCheck = 0;
-    int mqttCounter = 0;
+    volatile bool _update    = false;
+    bool          _wsStarted = false;
+    bool          _portalReq = false;
+    unsigned long _wifiCheck = 0;
+    int           _tick      = 0;
 
-    void setupWebRoutes();
-    void handleRoot();
-    void handleConfig();
-    void handleSave();
-    void handleLogs();
-    void handleClearLogs();
-    void handleWebCommand();
-    
-    void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+    // Web
+    void _startWebServer();
+    void _handleRoot      (AsyncWebServerRequest *req);
+    void _handleSettings  (AsyncWebServerRequest *req);
+    void _handleSave      (AsyncWebServerRequest *req);
+    void _handleLogs      (AsyncWebServerRequest *req);
+    void _handleClearLogs (AsyncWebServerRequest *req);
+    void _onWsEvent(AsyncWebSocket *srv, AsyncWebSocketClient *client,
+                    AwsEventType type, void *arg, uint8_t *data, size_t len);
+    void _handleWsText(const String &text);
 
-    static void onCoverCommand(HACover::CoverCommand cmd, HACover *sender);
-    static void onButtonCommand(HAButton* sender);
-    static void onPedWidthChange(HANumeric number, HANumber* sender);
+    // Telnet
+    void _pollTelnet();
+
+    // HA static callbacks
+    static void _onCover (HACover::CoverCommand cmd, HACover *s);
+    static void _onButton(HAButton *s);
+    static void _onPedWidth(HANumeric n, HANumber *s);
 };
 
-extern GateNetwork netManager;
-extern WiFiClient telnetClient;
-
-#endif
+extern GateNetwork gateNet;
+extern WiFiClient telnetClient;   // shared with Log.hpp

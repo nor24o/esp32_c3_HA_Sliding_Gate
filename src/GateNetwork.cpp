@@ -1,526 +1,437 @@
+/**
+ * @file Network.cpp
+ */
+
 #include "GateNetwork.h"
+#include "Motor.h"
+#include "RF.h"
+#include "Storage.h"
+#include "Log.hpp"
+#include "WifiWrapper.h"
 #include <LittleFS.h>
+#include <WiFi.h>
+#include <Update.h>
 
-GateNetwork netManager;
+GateNetwork gateNet;
+WiFiClient  telnetClient;
 
-// Helper to bridge C-style callbacks to the Queue
-void sendGlobalCmd(GateCommand cmd, float pos = -1.0)
+// ── Helper: post a command to the gate logic queue ───────────────────────────
+static void postCmd(GateCommand cmd, float pos = -1.0f,
+                    unsigned long code = 0, int aux = 0)
 {
-    CommandMessage msg = {cmd, pos, 0, 0};
-    xQueueSend(xCommandQueue, &msg, 0);
+    Command msg = { cmd, pos, code, aux };
+    xQueueSend(cmdQueue, &msg, 0);
 }
 
-GateNetwork::GateNetwork() : server(80), webSocket(81), telnetServer(23), mqtt(wifiClient, device),
-                             haCover("sliding_gate_cover"), rfCodeSensor("sliding_gate_last_rf_code"),
-                             btnCalibrate("sliding_gate_calibrate"), btnCancelCal("sliding_gate_calibrate_cancel"),
-                             btnMove50("sliding_gate_move_to_50"), pedWidthNumber("sliding_gate_ped_width"), gateState("sliding_gate_state"), gatePosition("sliding_gate_position"),
-                             gateIP("sliding_gate_IP"), travelTime("sliding_gate_travel_time"),
-                             btnOpen("sliding_gate_open_button"), btnClose("sliding_gate_close_button"),
-                             btnStop("sliding_gate_stop_button"), limOpen("sliding_gate_lim_open"),
-                             limClose("sliding_gate_lim_close"), barrier("sliding_gate_barrier")
+// ─────────────────────────────────────────────────────────────────────────────
+// Constructor — initialiser list order must match declaration order in .h
+// ─────────────────────────────────────────────────────────────────────────────
+GateNetwork::GateNetwork()
+    : _mqtt(_wifiClient, _device)
+    , btnOpen("gate_btn_open"),     btnClose("gate_btn_close")
+    , btnStop("gate_btn_stop"),     btnCalibrate("gate_btn_cal")
+    , btnCancelCal("gate_btn_cal_cancel"), btnPed("gate_btn_ped")
+    , pedWidth("gate_ped_width")
+    , _server(80)
+    , _ws("/ws")
+    , _telnet(23)
+    , _cover("gate_cover")
+    , _sLastRF("gate_last_rf"),     _sState("gate_state")
+    , _sIP("gate_ip"),              _sTravelTime("gate_travel_time")
+    , _sPosition("gate_position")
+    , _sLimOpen("gate_lim_open"),   _sLimClose("gate_lim_close")
+    , _sBarrier("gate_barrier")
 {
-    // ID Setup
-    byte mac[6];
-    WiFi.macAddress(mac);
-    device.setUniqueId(mac, sizeof(mac));
-    device.setName("Sliding Gate");
+    byte mac[6]; WiFi.macAddress(mac);
+    _device.setUniqueId(mac, sizeof(mac));
+    _device.setName("Sliding Gate");
+    _device.setModel("ESP32-C3");
+    _device.setManufacturer("H_N");
+    _device.setSoftwareVersion("1.0.0");
 
-    device.setModel("ESP32-C3");
-    device.setManufacturer("H_N");
+    _cover.setName("Sliding Gate"); _cover.setDeviceClass("gate");
+    _cover.onCommand(_onCover);
 
-    // HA Config
-    haCover.setName("Sliding Gate");
-    haCover.setDeviceClass("gate");
-    haCover.onCommand(onCoverCommand);
-    btnOpen.setName("Open Gate");
-    btnOpen.setIcon("mdi:gate-open");
-    btnOpen.onCommand(onButtonCommand);
-    btnClose.setName("Close Gate");
-    btnClose.setIcon("mdi:gate");
-    btnClose.onCommand(onButtonCommand);
-    btnStop.setName("Stop Gate");
-    btnStop.setIcon("mdi:stop-circle-outline");
-    btnStop.onCommand(onButtonCommand);
-    btnCalibrate.setName("Calibrate");
-    btnCalibrate.setIcon("mdi:ruler");
-    btnCalibrate.onCommand(onButtonCommand);
-    btnCancelCal.setName("Cancel Cal");
-    btnCancelCal.setIcon("mdi:cancel");
-    btnCancelCal.onCommand(onButtonCommand);
-    btnMove50.setName("Pedestrian");
-    btnMove50.setIcon("mdi:walk");
-    btnMove50.onCommand(onButtonCommand);
+    auto btn = [](HAButton &b, const char *name, const char *icon) {
+        b.setName(name); b.setIcon(icon); b.onCommand(_onButton);
+    };
+    btn(btnOpen,      "Open Gate",   "mdi:gate-open");
+    btn(btnClose,     "Close Gate",  "mdi:gate");
+    btn(btnStop,      "Stop Gate",   "mdi:stop-circle-outline");
+    btn(btnCalibrate, "Calibrate",   "mdi:ruler");
+    btn(btnCancelCal, "Cancel Cal",  "mdi:cancel");
+    btn(btnPed,       "Pedestrian",  "mdi:walk");
 
-    pedWidthNumber.setName("Pedestrian Width %");
-    pedWidthNumber.setIcon("mdi:arrow-expand-horizontal");
-    pedWidthNumber.setMin(10); // Minimum 10%
-    pedWidthNumber.setMax(90); // Maximum 90%
-    pedWidthNumber.setStep(10);
-    pedWidthNumber.setUnitOfMeasurement("%");
-    pedWidthNumber.onCommand(onPedWidthChange);
+    pedWidth.setName("Pedestrian Width %");
+    pedWidth.setIcon("mdi:arrow-expand-horizontal");
+    pedWidth.setMin(10); pedWidth.setMax(90); pedWidth.setStep(10);
+    pedWidth.setUnitOfMeasurement("%");
+    pedWidth.onCommand(_onPedWidth);
 
-    rfCodeSensor.setName("Last RF");
-    rfCodeSensor.setIcon("mdi:remote");
-    gateState.setName("Gate State");
-    gateState.setIcon("mdi:state-machine");
-    gateIP.setName("IP Address");
-    gateIP.setIcon("mdi:ip-network");
-    travelTime.setName("Travel Time");
-    travelTime.setIcon("mdi:timer-outline");
-    travelTime.setUnitOfMeasurement("s");
-
-    gatePosition.setName("Gate Position");
-    gatePosition.setIcon("mdi:gate-arrow-left-right");
-    gatePosition.setUnitOfMeasurement("%");
-
-    limOpen.setName("Open Limit");
-    limOpen.setIcon("mdi:arrow-left-bold-box-outline");
-    limClose.setName("Close Limit");
-    limClose.setIcon("mdi:arrow-right-bold-box-outline");
-
-    barrier.setName("Barrier");
-    barrier.setDeviceClass("safety");
-    barrier.setIcon("mdi:shield-alert");
+    _sLastRF.setName("Last RF");        _sLastRF.setIcon("mdi:remote");
+    _sState.setName("Gate State");      _sState.setIcon("mdi:state-machine");
+    _sIP.setName("IP Address");         _sIP.setIcon("mdi:ip-network");
+    _sTravelTime.setName("Travel Time");_sTravelTime.setIcon("mdi:timer-outline");
+    _sTravelTime.setUnitOfMeasurement("s");
+    _sPosition.setName("Gate Position");_sPosition.setIcon("mdi:gate-arrow-left-right");
+    _sPosition.setUnitOfMeasurement("%");
+    _sLimOpen.setName("Open Limit");    _sLimOpen.setIcon("mdi:arrow-left-bold-box-outline");
+    _sLimClose.setName("Close Limit");  _sLimClose.setIcon("mdi:arrow-right-bold-box-outline");
+    _sBarrier.setName("Barrier");       _sBarrier.setDeviceClass("safety");
+    _sBarrier.setIcon("mdi:shield-alert");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
 void GateNetwork::begin()
 {
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    // Disable Debug output to prevent Serial interference on Pin 1
-    wm.setDebugOutput(false);
-    wm.setConfigPortalBlocking(false);
+    wifiWrapperBegin();
 
-    if (wm.autoConnect("GateControllerAP"))
-        LOG_PRINTLN("WiFi Connected");
-    else
-        LOG_PRINTLN("WiFi Not Connected (Background AP)");
-    device.enableSharedAvailability(); // <--- Reduces network traffic significantly
-    mqtt.begin(sysConfig.config.mqtt_server, atoi(sysConfig.config.mqtt_port), sysConfig.config.mqtt_user, sysConfig.config.mqtt_pass);
-    pedWidthNumber.setCurrentState(sysConfig.config.pedestrian_percent);
-    telnetServer.begin();
+    _device.enableSharedAvailability();
+    _mqtt.begin(storage.cfg.mqttHost,
+                static_cast<uint16_t>(atoi(storage.cfg.mqttPort)),
+                storage.cfg.mqttUser, storage.cfg.mqttPass);
+
+    pedWidth.setCurrentState(storage.cfg.pedPercent);
+    _telnet.begin();
 }
 
-void GateNetwork::triggerWifiConfig() { configPortalRequested = true; }
-
-void GateNetwork::onCoverCommand(HACover::CoverCommand cmd, HACover *sender)
+// ─────────────────────────────────────────────────────────────────────────────
+// HA callbacks
+// ─────────────────────────────────────────────────────────────────────────────
+void GateNetwork::_onCover(HACover::CoverCommand cmd, HACover * /*s*/)
 {
-    if (cmd == HACover::CommandOpen)
-        sendGlobalCmd(CMD_OPEN);
-    else if (cmd == HACover::CommandClose)
-        sendGlobalCmd(CMD_CLOSE);
-    else if (cmd == HACover::CommandStop)
-        sendGlobalCmd(CMD_STOP_ONLY);
+    if      (cmd == HACover::CommandOpen)  postCmd(CMD_OPEN);
+    else if (cmd == HACover::CommandClose) postCmd(CMD_CLOSE);
+    else if (cmd == HACover::CommandStop)  postCmd(CMD_STOP_ONLY);
 }
 
-void GateNetwork::onButtonCommand(HAButton *sender)
+void GateNetwork::_onButton(HAButton *s)
 {
-    if (sender == &netManager.btnOpen)
-        sendGlobalCmd(CMD_OPEN);
-    else if (sender == &netManager.btnClose)
-        sendGlobalCmd(CMD_CLOSE);
-    else if (sender == &netManager.btnStop)
-        sendGlobalCmd(CMD_STOP_ONLY);
-    else if (sender == &netManager.btnCalibrate)
-        sendGlobalCmd(CMD_CALIBRATE_START);
-    else if (sender == &netManager.btnCancelCal)
-        sendGlobalCmd(CMD_CALIBRATE_CANCEL);
-    else if (sender == &netManager.btnMove50)
-    {
-        float target = (float)sysConfig.config.pedestrian_percent / 100.0f;
-        sendGlobalCmd(CMD_MOVE_TO_POSITION, target);
-    }
+    auto &n = gateNet;
+    if      (s == &n.btnOpen)      postCmd(CMD_OPEN);
+    else if (s == &n.btnClose)     postCmd(CMD_CLOSE);
+    else if (s == &n.btnStop)      postCmd(CMD_STOP_ONLY);
+    else if (s == &n.btnCalibrate) postCmd(CMD_CALIBRATE_START);
+    else if (s == &n.btnCancelCal) postCmd(CMD_CALIBRATE_CANCEL);
+    else if (s == &n.btnPed)
+        postCmd(CMD_MOVE_TO_POSITION, float(storage.cfg.pedPercent) / 100.0f);
 }
 
+void GateNetwork::_onPedWidth(HANumeric n, HANumber *s)
+{
+    const uint8_t pct = n.toUInt8();
+    if (pct == storage.cfg.pedPercent) return;
+    storage.cfg.pedPercent = pct;
+    storage.save();
+    s->setState(static_cast<int32_t>(pct));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// broadcastStatus() — WebSocket JSON + HA MQTT
+// ─────────────────────────────────────────────────────────────────────────────
 void GateNetwork::broadcastStatus()
 {
-    if (webSocket.connectedClients() > 0)
-    {
-        char json[400];
-        String status = "STOPPED";
-        String subStatus = "";
+    // ── WebSocket ────────────────────────────────────────────────────────────
+    if (_ws.count() > 0) {
+        const char *st  = "STOPPED";
+        String      sub = "";
 
-        if (gateMotor.currentOperation == OPENING)
-            status = "OPENING";
-        else if (gateMotor.currentOperation == CLOSING)
-            status = "CLOSING";
+        if      (motor.state == MotorState::OPENING) st = "OPENING";
+        else if (motor.state == MotorState::CLOSING) st = "CLOSING";
 
-        if (gateMotor.calState != CAL_INACTIVE)
-        {
-            status = "CALIBRATING";
-            if (gateMotor.calState == CAL_HOMING_CLOSE)
-                subStatus = "Homing...";
-            else if (gateMotor.calState == CAL_MEASURING_OPEN)
-                subStatus = "Measuring...";
-            else
-                subStatus = "Verifying...";
+        if (motor.calState != CalState::INACTIVE) {
+            st  = "CALIBRATING";
+            sub = (motor.calState == CalState::HOMING)    ? "Homing…"    :
+                  (motor.calState == CalState::MEASURING) ? "Measuring…" :
+                                                            "Verifying…";
         }
 
-        if (rfHandler.learnState == RF_SCANNING_WEB)
-        {
-            status = "SCANNING";
-            subStatus = (rfHandler.scannedCode > 0) ? String(rfHandler.scannedCode) : "Waiting...";
+        if (rf.learnState == RFLearnState::SCANNING_WEB) {
+            st  = "SCANNING";
+            sub = rf.scannedCode ? String(rf.scannedCode) : String("Waiting…");
         }
 
-        // Added "pw" (Pedestrian Width) to the JSON output below
+        char json[256];
         snprintf(json, sizeof(json),
-                 "{\"type\":\"status\",\"s\":\"%s\",\"ss\":\"%s\",\"p\":%d,\"lo\":%d,\"lc\":%d,\"pb\":%d,\"rf\":%lu,\"pw\":%d}",
-                 status.c_str(), subStatus.c_str(), (int)(gateMotor.currentPosition * 100),
-                 gateMotor.isOpenLimit() ? 0 : 1, gateMotor.isCloseLimit() ? 0 : 1,
-                 gateMotor.isBarrierTriggered() ? 0 : 1, rfHandler.lastCode,
-                 sysConfig.config.pedestrian_percent); // <--- Sending the config value
-
-        webSocket.broadcastTXT(json);
+                 "{\"type\":\"status\",\"s\":\"%s\",\"ss\":\"%s\",\"p\":%d,"
+                 "\"lo\":%d,\"lc\":%d,\"pb\":%d,\"rf\":%lu,\"pw\":%d,\"mq\":%d}",
+                 st, sub.c_str(),
+                 int(motor.position * 100),
+                 motor.openLimit()        ? 0 : 1,
+                 motor.closeLimit()       ? 0 : 1,
+                 motor.barrierTriggered() ? 0 : 1,
+                 rf.lastCode, storage.cfg.pedPercent,
+                 _mqtt.isConnected()      ? 1 : 0);
+        _ws.textAll(json);
     }
 
-    // HA Updates
-    haCover.setCurrentPosition(gateMotor.currentPosition * 100);
-
-    // Create a small buffer to hold the number string
-    char posBuf[8];
-    // Convert the position (0-100) into that buffer
-    snprintf(posBuf, sizeof(posBuf), "%d", (int)(gateMotor.currentPosition * 100));
-    // Send the string buffer
-    gatePosition.setValue(posBuf);
+    // ── Home Assistant ───────────────────────────────────────────────────────
+    const int posPct = int(motor.position * 100);
+    _cover.setCurrentPosition(uint8_t(posPct));
 
     char buf[16];
-    snprintf(buf, sizeof(buf), "%lu", sysConfig.config.travel_time / 1000);
-    travelTime.setValue(buf);
+    snprintf(buf, sizeof(buf), "%d", posPct);       _sPosition.setValue(buf);
+    snprintf(buf, sizeof(buf), "%lu", storage.cfg.travelTime / 1000UL);
+    _sTravelTime.setValue(buf);
 
-    if (gateMotor.currentOperation == OPENING)
-    {
-        haCover.setState(HACover::StateOpening);
-        gateState.setValue("opening");
-    }
-    else if (gateMotor.currentOperation == CLOSING)
-    {
-        haCover.setState(HACover::StateClosing);
-        gateState.setValue("closing");
-    }
-    else if (gateMotor.currentPosition >= 0.99)
-    {
-        haCover.setState(HACover::StateOpen);
-        gateState.setValue("open");
-    }
-    else if (gateMotor.currentPosition <= 0.01)
-    {
-        haCover.setState(HACover::StateClosed);
-        gateState.setValue("closed");
-    }
-    else
-    {
-        haCover.setState(HACover::StateStopped);
-        gateState.setValue("stopped");
-    }
+    if      (motor.state == MotorState::OPENING) { _cover.setState(HACover::StateOpening); _sState.setValue("opening"); }
+    else if (motor.state == MotorState::CLOSING) { _cover.setState(HACover::StateClosing); _sState.setValue("closing"); }
+    else if (motor.position >= 0.99f)            { _cover.setState(HACover::StateOpen);    _sState.setValue("open");    }
+    else if (motor.position <= 0.01f)            { _cover.setState(HACover::StateClosed);  _sState.setValue("closed");  }
+    else                                         { _cover.setState(HACover::StateStopped); _sState.setValue("stopped"); }
 
-    gateIP.setValue(WiFi.localIP().toString().c_str());
-    limOpen.setState(gateMotor.isOpenLimit());
-    limClose.setState(gateMotor.isCloseLimit());
-    barrier.setState(gateMotor.isBarrierTriggered());
+    _sIP.setValue(WiFi.localIP().toString().c_str());
+    _sLimOpen.setState(motor.openLimit());
+    _sLimClose.setState(motor.closeLimit());
+    _sBarrier.setState(motor.barrierTriggered());
 
-    char codeStr[20];
-    sprintf(codeStr, "%lu", rfHandler.lastCode);
-    rfCodeSensor.setValue(codeStr);
+    char code[20]; snprintf(code, sizeof(code), "%lu", rf.lastCode);
+    _sLastRF.setValue(code);
 }
 
-void GateNetwork::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
+// ─────────────────────────────────────────────────────────────────────────────
+void GateNetwork::sendRFList()
 {
-    if (type == WStype_CONNECTED)
-    {
-        netManager.broadcastStatus();
-        netManager.sendRFListToWeb();
+    if (_ws.count() == 0) return;
+    String j;
+    j.reserve(64 + rf.keys.size() * 28);
+    j = "{\"type\":\"rf_list\",\"data\":[";
+    for (size_t i = 0; i < rf.keys.size(); i++) {
+        j += "{\"c\":"; j += rf.keys[i].code;
+        j += ",\"f\":"; j += rf.keys[i].function; j += "}";
+        if (i + 1 < rf.keys.size()) j += ',';
     }
-    else if (type == WStype_TEXT)
-    {
-        String text = String((char *)payload);
-        if (text == "OPEN")
-            sendGlobalCmd(CMD_OPEN);
-        else if (text == "CLOSE")
-            sendGlobalCmd(CMD_CLOSE);
-        else if (text == "STOP")
-            sendGlobalCmd(CMD_STOP_ONLY);
-        else if (text == "CALIBRATE")
-            sendGlobalCmd(CMD_CALIBRATE_START);
-        else if (text == "CALIBRATE_CANCEL")
-            sendGlobalCmd(CMD_CALIBRATE_CANCEL);
-        else if (text == "SCAN_START")
-        {
-            CommandMessage msg = {CMD_RF_SCAN_MODE, 0, 0, 1};
-            xQueueSend(xCommandQueue, &msg, 0);
-        }
-        else if (text == "SCAN_STOP")
-        {
-            CommandMessage msg = {CMD_RF_SCAN_MODE, 0, 0, 0};
-            xQueueSend(xCommandQueue, &msg, 0);
-        }
-        else if (text == "WIFI_CONFIG")
-        {
-            netManager.triggerWifiConfig();
-        }
+    j += "]}";
+    _ws.textAll(j);
+}
 
-        if (text.startsWith("ADD:"))
-        {
-            int fst = text.indexOf(':');
-            int sec = text.lastIndexOf(':');
-            if (fst > 0 && sec > fst)
-            {
-                String c = text.substring(fst + 1, sec);
-                String f = text.substring(sec + 1);
-                CommandMessage msg = {CMD_RF_ADD_CODE, 0, strtoul(c.c_str(), NULL, 10), f.toInt()};
-                xQueueSend(xCommandQueue, &msg, 0);
+// ─────────────────────────────────────────────────────────────────────────────
+// WebSocket events
+// ─────────────────────────────────────────────────────────────────────────────
+void GateNetwork::_onWsEvent(AsyncWebSocket * /*s*/, AsyncWebSocketClient *client,
+                          AwsEventType type, void * /*arg*/,
+                          uint8_t *data, size_t len)
+{
+    if (type == WS_EVT_CONNECT) {
+        LOG_PRINTF("[Net] WS #%lu connected\n", (unsigned long)client->id());
+        broadcastStatus(); sendRFList();
+    } else if (type == WS_EVT_DISCONNECT) {
+        LOG_PRINTF("[Net] WS #%lu disconnected\n", (unsigned long)client->id());
+    } else if (type == WS_EVT_DATA) {
+        char buf[64] = {};
+        size_t copyLen = len < (sizeof(buf) - 1) ? len : (sizeof(buf) - 1);
+        memcpy(buf, data, copyLen);
+        _handleWsText(String(buf));
+    } else if (type == WS_EVT_ERROR) {
+        LOG_PRINTF("[Net] WS #%lu error\n", (unsigned long)client->id());
+    }
+}
+
+void GateNetwork::_handleWsText(const String &t)
+{
+    if      (t == "OPEN")             postCmd(CMD_OPEN);
+    else if (t == "CLOSE")            postCmd(CMD_CLOSE);
+    else if (t == "STOP")             postCmd(CMD_STOP_ONLY);
+    else if (t == "CALIBRATE")        postCmd(CMD_CALIBRATE_START);
+    else if (t == "CALIBRATE_CANCEL") postCmd(CMD_CALIBRATE_CANCEL);
+    else if (t == "WIFI_CONFIG")      startWifiPortal();
+    else if (t == "SCAN_START")       postCmd(CMD_RF_SCAN_MODE, -1, 0, 1);
+    else if (t == "SCAN_STOP")        postCmd(CMD_RF_SCAN_MODE, -1, 0, 0);
+    else if (t.startsWith("ADD:")) {
+        const int a = t.indexOf(':'), b = t.lastIndexOf(':');
+        if (a > 0 && b > a)
+            postCmd(CMD_RF_ADD_CODE, -1,
+                    (unsigned long)t.substring(a + 1, b).toInt(),
+                    t.substring(b + 1).toInt());
+    } else if (t.startsWith("DEL:")) {
+        postCmd(CMD_RF_DELETE_CODE, -1, 0, t.substring(4).toInt());
+    } else if (t.startsWith("MOVE:")) {
+        postCmd(CMD_MOVE_TO_POSITION, t.substring(5).toFloat() / 100.0f);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP route handlers
+// ─────────────────────────────────────────────────────────────────────────────
+void GateNetwork::_handleRoot(AsyncWebServerRequest *req)
+{
+    LittleFS.exists("/index.html")
+        ? req->send(LittleFS, "/index.html", "text/html")
+        : req->send(404, "text/plain", "index.html missing from LittleFS");
+}
+
+void GateNetwork::_handleSettings(AsyncWebServerRequest *req)
+{
+    auto &c = storage.cfg;
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{\"mq_ip\":\"%s\",\"mq_pt\":\"%s\",\"mq_us\":\"%s\",\"mq_pw\":\"%s\","
+        "\"tt\":%lu,\"mdd\":%lu,\"rfd\":%lu,\"p_bd\":%lu,\"ac_od\":%lu,\"ac_opn\":%d,"
+        "\"acd\":%lu,\"ac_bar\":%d,\"bh\":%d,\"lh\":%d,\"motor_mode\":%d}",
+        c.mqttHost, c.mqttPort, c.mqttUser, c.mqttPass,
+        c.travelTime, c.motorDelay, c.rfDebounce, c.preBlinkDelay, c.acOpenDelay,
+        c.acOpenEnabled ? 1 : 0, c.acDelay, c.acEnabled ? 1 : 0, 
+        c.barrierActiveHigh ? 1 : 0, c.limitsActiveHigh ? 1 : 0, c.motorMode);
+    req->send(200, "application/json", json);
+}
+
+void GateNetwork::_handleSave(AsyncWebServerRequest *req)
+{
+    auto &c = storage.cfg;
+    auto copyArg = [&](const char *k, char *dst, size_t n) {
+        if (req->hasArg(k)) { strncpy(dst, req->arg(k).c_str(), n-1); dst[n-1]='\0'; }
+    };
+    copyArg("mq_ip", c.mqttHost, sizeof(c.mqttHost));
+    copyArg("mq_pt", c.mqttPort, sizeof(c.mqttPort));
+    copyArg("mq_us", c.mqttUser, sizeof(c.mqttUser));
+    copyArg("mq_pw", c.mqttPass, sizeof(c.mqttPass));
+    if (req->hasArg("tt"))  c.travelTime = req->arg("tt").toInt();
+    if (req->hasArg("mdd")) c.motorDelay = req->arg("mdd").toInt();
+    if (req->hasArg("rfd")) c.rfDebounce = req->arg("rfd").toInt();
+    if (req->hasArg("p_bd"))  c.preBlinkDelay = req->arg("p_bd").toInt();
+    if (req->hasArg("ac_od")) c.acOpenDelay   = req->arg("ac_od").toInt();
+    c.acOpenEnabled     = req->hasArg("ac_opn");
+    if (req->hasArg("acd")) c.acDelay    = req->arg("acd").toInt();
+    c.acEnabled         = req->hasArg("ac_bar");
+    c.barrierActiveHigh = req->hasArg("bh");
+    c.limitsActiveHigh  = req->hasArg("lh");
+    if (req->hasArg("motor_mode")) c.motorMode = req->arg("motor_mode").toInt();
+    storage.save();
+
+    req->send(200, "text/plain", "Settings saved successfully!\n\n(Note: Changes to motor timings take effect immediately. Changes to MQTT require a reboot).");
+}
+
+void GateNetwork::_handleLogs(AsyncWebServerRequest *req)
+{
+    LittleFS.exists("/system_log.txt")
+        ? req->send(LittleFS, "/system_log.txt", "text/plain")
+        : req->send(200, "text/plain", "No log file.");
+}
+
+void GateNetwork::_handleClearLogs(AsyncWebServerRequest *req)
+{
+    storage.clearLog();
+    req->send(200, "text/plain", "Log cleared.");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// _startWebServer()
+// ─────────────────────────────────────────────────────────────────────────────
+void GateNetwork::_startWebServer()
+{
+    _ws.onEvent([this](AsyncWebSocket *s, AsyncWebSocketClient *c,
+                       AwsEventType t, void *a, uint8_t *d, size_t l)
+    { _onWsEvent(s, c, t, a, d, l); });
+    _server.addHandler(&_ws);
+
+    _server.on("/",           HTTP_GET,  [this](AsyncWebServerRequest *r){ _handleRoot(r);      });
+    _server.on("/settings",   HTTP_GET,  [this](AsyncWebServerRequest *r){ _handleSettings(r);  });
+    _server.on("/save",       HTTP_POST, [this](AsyncWebServerRequest *r){ _handleSave(r);      });
+    _server.on("/logs",       HTTP_GET,  [this](AsyncWebServerRequest *r){ _handleLogs(r);      });
+    _server.on("/clear_logs", HTTP_GET,  [this](AsyncWebServerRequest *r){ _handleClearLogs(r); });
+    _server.on("/open",       HTTP_GET,  [](AsyncWebServerRequest *r){ postCmd(CMD_OPEN);      r->redirect("/"); });
+    _server.on("/close",      HTTP_GET,  [](AsyncWebServerRequest *r){ postCmd(CMD_CLOSE);     r->redirect("/"); });
+    _server.on("/stop",       HTTP_GET,  [](AsyncWebServerRequest *r){ postCmd(CMD_STOP_ONLY); r->redirect("/"); });
+    _server.onNotFound([](AsyncWebServerRequest *r){ r->send(404, "text/plain", "Not found"); });
+
+    // OTA Firmware Update
+    _server.on("/update", HTTP_POST, [](AsyncWebServerRequest *req){
+        AsyncWebServerResponse *response = req->beginResponse(200, "text/plain", (Update.hasError()) ? "OTA FAIL" : "OTA SUCCESS! Rebooting...");
+        response->addHeader("Connection", "close");
+        req->send(response);
+    }, [](AsyncWebServerRequest *req, String filename, size_t index, uint8_t *data, size_t len, bool final){
+        if(!index){
+            LOG_PRINTF("[OTA] Update Start: %s\n", filename.c_str());
+            if(!Update.begin(UPDATE_SIZE_UNKNOWN)){
+                Update.printError(Serial);
             }
         }
-        if (text.startsWith("DEL:"))
-        {
-            CommandMessage msg = {CMD_RF_DELETE_CODE, 0, 0, text.substring(4).toInt()};
-            xQueueSend(xCommandQueue, &msg, 0);
+        if(!Update.hasError()){
+            if(Update.write(data, len) != len){
+                Update.printError(Serial);
+            }
+        }
+        if(final){
+            if(Update.end(true)){
+                LOG_PRINTF("[OTA] Update Success: %uB\n", index+len);
+                postCmd(CMD_REBOOT);
+            } else {
+                Update.printError(Serial);
+            }
+        }
+    });
+
+    _server.begin();
+    MDNS.begin("gate");
+    _wsStarted = true;
+    LOG_PRINTLN("[Net] HTTP+WS server started on port 80 (/ws).");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// _pollTelnet()
+// ─────────────────────────────────────────────────────────────────────────────
+void GateNetwork::_pollTelnet()
+{
+    if (_telnet.hasClient()) {
+        WiFiClient newClient = _telnet.accept();
+        if (xSemaphoreTake(logMtx, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (telnetClient) telnetClient.stop();
+            telnetClient = newClient;
+            xSemaphoreGive(logMtx);
         }
     }
-}
+    if (!telnetClient || !telnetClient.connected() || !telnetClient.available()) return;
 
-void GateNetwork::sendRFListToWeb()
-{
-    String json = "{\"type\":\"rf_list\",\"data\":[";
-    for (size_t i = 0; i < rfHandler.keyList.size(); i++)
-    {
-        json += "{\"c\":" + String(rfHandler.keyList[i].code) + ",\"f\":" + String(rfHandler.keyList[i].function) + "}";
-        if (i < rfHandler.keyList.size() - 1)
-            json += ",";
+    String cmd = telnetClient.readStringUntil('\n');
+    cmd.trim();
+    if      (cmd == "logs")         storage.dumpLog();
+    else if (cmd == "clearlogs")    storage.clearLog();
+    else if (cmd == "status")       broadcastStatus();
+    else if (cmd == "wificonfig")   startWifiPortal();
+    else if (cmd == "restart")      postCmd(CMD_REBOOT);
+    else {
+        telnetClient.println("Commands: logs | clearlogs | status | wificonfig | restart");
     }
-    json += "]}";
-    webSocket.broadcastTXT(json);
 }
 
-void GateNetwork::setupWebRoutes()
-{
-    server.on("/", [this]()
-              { handleRoot(); });
-    server.on("/config", [this]()
-              { handleConfig(); });
-    server.on("/save", HTTP_POST, [this]()
-              { handleSave(); });
-    server.on("/logs", [this]()
-              { handleLogs(); });
-    server.on("/clear_logs", [this]()
-              { handleClearLogs(); });
-    server.onNotFound([this]()
-                      { handleWebCommand(); });
-    server.begin();
-    webSocket.begin();
-    webSocket.onEvent([this](uint8_t n, WStype_t t, uint8_t *p, size_t l)
-                      { onWebSocketEvent(n, t, p, l); });
-    MDNS.begin("gate");
-    webServerStarted = true;
-    LOG_PRINTLN("Web Started");
-}
-
+// ─────────────────────────────────────────────────────────────────────────────
+// loop() — called from vNetworkTask every 25 ms
+// ─────────────────────────────────────────────────────────────────────────────
 void GateNetwork::loop()
 {
-    wm.process();
-    if (simCrashNetwork)
-        while (1)
-            vTaskDelay(1);
+    wifiWrapperProcess();
 
-    if (configPortalRequested)
-    {
-        if (webServerStarted)
-        {
-            server.stop();
-            webServerStarted = false;
-        }
-        wm.startConfigPortal("GateControllerAP");
-        configPortalRequested = false;
+    if (_portalReq) {
+        if (_wsStarted) { _ws.closeAll(); _server.end(); _wsStarted = false; }
+        wifiWrapperStartPortal();
+        _portalReq = false;
     }
 
-    if (wm.getConfigPortalActive())
-        return;
+    if (wifiWrapperIsPortalActive()) return;
 
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        if (!webServerStarted)
-            setupWebRoutes();
-        server.handleClient();
-        webSocket.loop();
-        mqtt.loop();
-
-        if (telnetServer.hasClient())
-        {
-            if (telnetClient)
-                telnetClient.stop();
-            telnetClient = telnetServer.accept();
-        }
-        if (telnetClient && telnetClient.connected() && telnetClient.available())
-        {
-            String cmd = telnetClient.readStringUntil('\n');
-            cmd.trim();
-            if (cmd == "logs")
-                sysConfig.dumpLog();
-            else if (cmd == "restart")
-                ESP.restart();
-            else if (cmd == "clearlogs")
-                sysConfig.clearLog();
-            else if (cmd == "status")
-                broadcastStatus();
-            else if (cmd == "wificonfig")
-                triggerWifiConfig();
-            else if (cmd == "help")
-            {
-                telnetClient.println("Available commands:");
-                telnetClient.println("logs - Dump system logs");
-                telnetClient.println("clearlogs - Clear system logs");
-                telnetClient.println("status - Broadcast current status");
-                telnetClient.println("wificonfig - Start WiFi config portal");
-                telnetClient.println("restart - Restart the device");
-            }
-        }
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!_wsStarted) _startWebServer();
+        _ws.cleanupClients();
+        _mqtt.loop();
+        _pollTelnet();
     }
 
-    if (millis() - lastWifiCheck > WIFI_RETRY_INTERVAL)
-    {
-        lastWifiCheck = millis();
-        if (WiFi.status() != WL_CONNECTED)
-            LOG_PRINTLN("WiFi Reconnecting...");
+    if (millis() - _wifiCheck > T_WIFI_RETRY) {
+        _wifiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED) LOG_PRINTLN("[Net] WiFi reconnecting…");
     }
 
-    // --- NEW "SNAPPY" LOGIC START ---
+    // Adaptive broadcast rate: fast while moving, slow while idle
+    const bool busy = (motor.state != MotorState::IDLE ||
+                       motor.calState != CalState::INACTIVE);
+    const int  rate = busy ? 10 : 120;   // ticks at 25 ms each → 250 ms / 3 s
 
-    // 1. Determine how often we SHOULD update automatically
-    // If gate is moving or calibrating: Update fast (every 250ms)
-    // If idle: Update slow (every 3000ms)
-    int requiredInterval = (gateMotor.currentOperation != IDLE || gateMotor.calState != CAL_INACTIVE) ? 10 : 120;
-
-    mqttCounter++;
-
-    // 2. Broadcast if: Time is up OR someone requested an immediate update
-    if (updateRequest || mqttCounter > requiredInterval)
-    {
-        mqttCounter = 0;
-        updateRequest = false; // Reset the flag
-
-        if (xSemaphoreTake(xStateMutex, 10))
-        {
+    if (_update || ++_tick >= rate) {
+        _tick   = 0;
+        _update = false;
+        if (xSemaphoreTake(stateMtx, pdMS_TO_TICKS(10)) == pdTRUE) {
             broadcastStatus();
-            xSemaphoreGive(xStateMutex);
+            xSemaphoreGive(stateMtx);
         }
-    }
-}
-
-// --- FILE SYSTEM HANDLERS ---
-
-void GateNetwork::handleRoot()
-{
-    if (LittleFS.exists("/index.html"))
-    {
-        File file = LittleFS.open("/index.html", "r");
-        server.streamFile(file, "text/html");
-        file.close();
-    }
-    else
-    {
-        server.send(404, "text/plain", "Error: index.html missing");
-    }
-}
-
-void GateNetwork::handleConfig()
-{
-    if (!LittleFS.exists("/config.html"))
-    {
-        server.send(404, "text/plain", "Error: config.html missing");
-        return;
-    }
-
-    File file = LittleFS.open("/config.html", "r");
-    String html = file.readString();
-    file.close();
-
-    html.replace("%MQ_IP%", String(sysConfig.config.mqtt_server));
-    html.replace("%MQ_PT%", String(sysConfig.config.mqtt_port));
-    html.replace("%MQ_US%", String(sysConfig.config.mqtt_user));
-    html.replace("%MQ_PW%", String(sysConfig.config.mqtt_pass));
-
-    html.replace("%TT%", String(sysConfig.config.travel_time));
-    html.replace("%MDD%", String(sysConfig.config.motor_delay));
-    html.replace("%RFD%", String(sysConfig.config.rf_debounce));
-    html.replace("%ACD%", String(sysConfig.config.ac_delay));
-
-    html.replace("%CHK_AC%", sysConfig.config.ac_barrier ? "checked" : "");
-    html.replace("%CHK_BH%", sysConfig.config.bar_active_high ? "checked" : "");
-    html.replace("%CHK_LH%", sysConfig.config.lim_active_high ? "checked" : "");
-
-    server.send(200, "text/html", html);
-}
-
-void GateNetwork::handleLogs()
-{
-    if (LittleFS.exists("/system_log.txt"))
-    {
-        File f = LittleFS.open("/system_log.txt", "r");
-        server.streamFile(f, "text/plain");
-        f.close();
-    }
-    else
-        server.send(200, "text/plain", "No logs.");
-}
-
-void GateNetwork::handleClearLogs()
-{
-    sysConfig.clearLog();
-    server.send(200, "text/plain", "Cleared");
-}
-
-void GateNetwork::handleWebCommand()
-{
-    String p = server.uri();
-    if (p == "/open")
-        sendGlobalCmd(CMD_OPEN);
-    else if (p == "/close")
-        sendGlobalCmd(CMD_CLOSE);
-    else if (p == "/stop")
-        sendGlobalCmd(CMD_STOP_ONLY);
-    server.sendHeader("Location", "/");
-    server.send(303);
-}
-
-void GateNetwork::handleSave()
-{
-    if (server.hasArg("mq_ip"))
-        strncpy(sysConfig.config.mqtt_server, server.arg("mq_ip").c_str(), 40);
-    if (server.hasArg("mq_pt"))
-        strncpy(sysConfig.config.mqtt_port, server.arg("mq_pt").c_str(), 6);
-    if (server.hasArg("mq_us"))
-        strncpy(sysConfig.config.mqtt_user, server.arg("mq_us").c_str(), 32);
-    if (server.hasArg("mq_pw"))
-        strncpy(sysConfig.config.mqtt_pass, server.arg("mq_pw").c_str(), 64);
-    if (server.hasArg("tt"))
-        sysConfig.config.travel_time = server.arg("tt").toInt();
-    if (server.hasArg("mdd"))
-        sysConfig.config.motor_delay = server.arg("mdd").toInt();
-    if (server.hasArg("rfd"))
-        sysConfig.config.rf_debounce = server.arg("rfd").toInt();
-    if (server.hasArg("acd"))
-        sysConfig.config.ac_delay = server.arg("acd").toInt();
-
-    sysConfig.config.ac_barrier = server.hasArg("ac_bar");
-    sysConfig.config.bar_active_high = server.hasArg("bh");
-    sysConfig.config.lim_active_high = server.hasArg("lh");
-
-    sysConfig.save();
-    server.send(200, "text/html", "Saved. Rebooting...");
-    delay(500);
-    ESP.restart();
-}
-
-void GateNetwork::onPedWidthChange(HANumeric number, HANumber *sender)
-{
-    // 1. Extract value using .toUInt8() since we store it as uint8_t
-    uint8_t newPercent = number.toUInt8();
-
-    if (newPercent != sysConfig.config.pedestrian_percent)
-    {
-        sysConfig.config.pedestrian_percent = newPercent;
-        sysConfig.save();
-
-        // 2. Cast to (int32_t) to resolve ambiguity in setState overloads
-        sender->setState((int32_t)newPercent);
     }
 }

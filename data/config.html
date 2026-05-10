@@ -1,40 +1,61 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Config</title>
-    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gate Settings</title>
     <style>
-        body{font-family:sans-serif;margin:20px;background-color:#f4f4f4}
-        .card{background:white;padding:20px;border-radius:10px;box-shadow:0 2px 5px rgba(0,0,0,0.1);max-width:400px;margin:auto}
-        input{width:100%;padding:10px;margin:8px 0;box-sizing:border-box;border:1px solid #ccc;border-radius:4px}
-        input[type=submit]{background-color:#007bff;color:white;cursor:pointer;padding:12px;border:none;border-radius:4px;width:100%}
+        body { font-family: system-ui; background: #0f172a; color: #f8fafc; padding: 20px; margin: 0; }
+        .box { background: #1e293b; padding: 25px; border-radius: 12px; max-width: 450px; margin: 0 auto; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h2, h3 { color: #f8fafc; margin-top: 0; }
+        input[type="text"], input[type="number"], input[type="password"] { width: 100%; padding: 10px; margin: 5px 0 15px; border-radius: 6px; box-sizing: border-box; background: #334155; border: 1px solid #475569; color: white; }
+        input[type="submit"] { background: #3b82f6; color: white; padding: 12px; border: none; width: 100%; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: bold; margin-top: 10px; }
+        input[type="submit"]:hover { opacity: 0.9; }
+        label { font-size: 14px; color: #cbd5e1; }
+        .radio-label { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: #f8fafc; font-size: 15px; }
+        hr { border: none; border-top: 1px solid #475569; margin: 20px 0; }
     </style>
 </head>
 <body>
-    <div class='card'>
-        <h2>Configuration</h2>
-        <form action='/save' method='POST'>
-            <label>MQTT IP:</label><input type='text' name='mq_ip' value='%MQ_IP%'>
-            <label>MQTT Port:</label><input type='text' name='mq_pt' value='%MQ_PT%'>
-            <label>MQTT User:</label><input type='text' name='mq_us' value='%MQ_US%'>
-            <label>MQTT Pass:</label><input type='password' name='mq_pw' value='%MQ_PW%'>
-
+    <div class="box">
+        <h2>⚙️ System Configuration</h2>
+        <form action="/save" method="POST">
+            <h3>Motor Mode</h3>
+            <label class="radio-label"><input type="radio" name="motor_mode" value="1" %MM1%> Mode 1: Relay 1 (Dir) + Relay 2 (Power)</label>
+            <label class="radio-label"><input type="radio" name="motor_mode" value="2" %MM2%> Mode 2: Relay 1 (Open) + Relay 2 (Close)</label>
             <hr>
-            <h3 style='margin-bottom:5px'>Timing Settings</h3>
-            <label>Travel Time (ms):</label><input type='number' name='tt' value='%TT%'>
-            <label>Motor Delay (ms):</label><input type='number' name='mdd' value='%MDD%'>
-            <label>RF Debounce (ms):</label><input type='number' name='rfd' value='%RFD%'>
-            <label>Auto-Close Delay (ms):</label><input type='number' name='acd' value='%ACD%'>
-
-            <div style='text-align:left;margin:10px 0;padding:10px;background:#eee;border-radius:4px'>
-                <label><input type='checkbox' name='ac_bar' %CHK_AC%> Auto-Close after Barrier</label><br>
-                <label><input type='checkbox' name='bh' %CHK_BH%> Barrier Active HIGH</label><br>
-                <label><input type='checkbox' name='lh' %CHK_LH%> Limits Active HIGH</label>
-            </div>
-
-            <input type='submit' value='SAVE & REBOOT'>
+            <h3>Timing & Logic</h3>
+            <label>Relay Switch Delay (ms):</label> <input type="number" name="mdd" value="%MDD%">
+            <label>Max Travel Time (ms):</label>    <input type="number" name="tt" value="%TT%">
+            <label>RF Debounce (ms):</label>        <input type="number" name="rfd" value="%RFD%">
+            <label>Pre-Blink Warning Delay (ms):</label> <input type="number" name="p_bd" value="%P_BD%">
+            <label class="radio-label"><input type="checkbox" name="ac_opn" %CHK_ACO%> Auto-Close when Fully Open</label>
+            <label>Fully Open Auto-Close Time (ms):</label> <input type="number" name="ac_od" value="%AC_OD%">
+            <label class="radio-label"><input type="checkbox" name="ac_bar" %CHK_AC%> Auto-Close after Barrier Clear</label>
+            <label>Barrier Auto-Close Delay (ms):</label>   <input type="number" name="acd" value="%ACD%">
+            <label class="radio-label"><input type="checkbox" name="bh" %CHK_BH%> Invert Photo Barrier (Active High)</label>
+            <label class="radio-label"><input type="checkbox" name="lh" %CHK_LH%> Invert Limit Switches (Active High)</label>
+            <hr>
+            <h3>MQTT Setup</h3>
+            <label>Host IP</label>   <input type="text" name="mq_ip" value="%MQ_IP%">
+            <label>Port</label>      <input type="text" name="mq_pt" value="%MQ_PT%">
+            <label>Username</label>  <input type="text" name="mq_us" value="%MQ_US%">
+            <label>Password</label>  <input type="password" name="mq_pw" value="%MQ_PW%">
+            <input type="submit" value="Save & Reboot">
+            <p style="text-align:center; margin-top: 15px;"><a href="/" style="color:#3b82f6; text-decoration: none; font-weight: bold;">← Back to Dashboard</a></p>
         </form>
-        <br><center><a href='/'>Back to Controls</a></center>
+    </div>
+
+    <div class="box" style="margin-top: 20px;">
+        <h2>🔄 Firmware OTA Update</h2>
+        <form method='POST' action='/update' enctype='multipart/form-data' id='otaForm'>
+            <input type='file' name='update' required style="margin-bottom: 15px; color: white;">
+            <input type='submit' value='Upload & Flash' style="background: #ef4444; margin-top: 0;">
+        </form>
+        <script>
+            document.getElementById('otaForm').onsubmit = function() {
+                this.querySelector('input[type="submit"]').value = "Flashing... Please wait!";
+            };
+        </script>
     </div>
 </body>
 </html>

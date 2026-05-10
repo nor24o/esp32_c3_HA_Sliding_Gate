@@ -1,0 +1,18 @@
+# Gate Controller – Custom Partition Table
+# Target : ESP32-C3, 4MB flash (no OTA required)
+#
+# Layout (4MB = 0x400000 total)
+# ─────────────────────────────────────────────────────────────
+# 0x0000  – 0x8FFF   Bootloader (flashed separately, not in CSV)
+# 0x9000  – 0xDFFF   NVS         20 KB  – Preferences (config + RF keys)
+# 0xF000  – 0xEFFF   PHY init     4 KB  – RF calibration data (required)
+# 0x10000 – 0x1AFFFF App        1.62MB  – Firmware (current ~1.32MB, +300KB slack)
+# 0x1B0000– 0x1FFFFF LittleFS   320 KB  – Web files (index.html, config.html, log)
+#
+# Total used: 2MB of 4MB.  Upper 2MB left free (available for future use).
+#
+# Name,     Type,  SubType,  Offset,   Size,    Flags
+nvs,         data,  nvs,      0x9000,   0x5000,
+phy_init,    data,  phy,      0xF000,   0x1000,
+factory,     app,   factory,  0x10000,  0x1A0000,
+spiffs,      data,  spiffs,   0x1B0000, 0x50000,
