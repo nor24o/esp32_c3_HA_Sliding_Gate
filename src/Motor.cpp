@@ -14,13 +14,13 @@ Motor motor;
 // ─────────────────────────────────────────────────────────────────────────────
 void Motor::begin()
 {
-    pinMode(PIN_RELAY_1, OUTPUT); digitalWrite(PIN_RELAY_1, LOW);
-    pinMode(PIN_RELAY_2, OUTPUT); digitalWrite(PIN_RELAY_2, LOW);
+    pinMode(storage.cfg.pinRelay1, OUTPUT); digitalWrite(storage.cfg.pinRelay1, LOW);
+    pinMode(storage.cfg.pinRelay2, OUTPUT); digitalWrite(storage.cfg.pinRelay2, LOW);
 
-    pinMode(PIN_INDICATOR, OUTPUT);   digitalWrite(PIN_INDICATOR, LOW);
-    pinMode(PIN_LIM_OPEN,  INPUT_PULLUP);
-    pinMode(PIN_LIM_CLOSE, INPUT_PULLUP);
-    pinMode(PIN_BARRIER,   INPUT_PULLUP);
+    pinMode(storage.cfg.pinIndicator, OUTPUT);   digitalWrite(storage.cfg.pinIndicator, LOW);
+    pinMode(storage.cfg.pinLimOpen,  INPUT_PULLUP);
+    pinMode(storage.cfg.pinLimClose, INPUT_PULLUP);
+    pinMode(storage.cfg.pinBarrier,   INPUT_PULLUP);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,19 +28,19 @@ void Motor::begin()
 // ─────────────────────────────────────────────────────────────────────────────
 bool Motor::barrierTriggered() const
 {
-    const bool raw = (digitalRead(PIN_BARRIER) == HIGH);
+    const bool raw = (digitalRead(storage.cfg.pinBarrier) == HIGH);
     return storage.cfg.barrierActiveHigh ? raw : !raw;
 }
 
 bool Motor::openLimit() const
 {
-    const bool raw = (digitalRead(PIN_LIM_OPEN) == HIGH);
+    const bool raw = (digitalRead(storage.cfg.pinLimOpen) == HIGH);
     return storage.cfg.limitsActiveHigh ? raw : !raw;
 }
 
 bool Motor::closeLimit() const
 {
-    const bool raw = (digitalRead(PIN_LIM_CLOSE) == HIGH);
+    const bool raw = (digitalRead(storage.cfg.pinLimClose) == HIGH);
     return storage.cfg.limitsActiveHigh ? raw : !raw;
 }
 
@@ -62,14 +62,14 @@ void Motor::tick()
 void Motor::updateLed()
 {
     if (blinkMs == 0) {
-        if (_ledState) { digitalWrite(PIN_INDICATOR, LOW); _ledState = false; }
+        if (_ledState) { digitalWrite(storage.cfg.pinIndicator, LOW); _ledState = false; }
         return;
     }
     const unsigned long now = millis();
     if (now - _ledLast >= blinkMs) {
         _ledLast  = now;
         _ledState = !_ledState;
-        digitalWrite(PIN_INDICATOR, _ledState ? HIGH : LOW);
+        digitalWrite(storage.cfg.pinIndicator, _ledState ? HIGH : LOW);
     }
 }
 
@@ -163,12 +163,12 @@ void Motor::cancelCalibration()
 void Motor::printIO()
 {
     int m1 = 0, m2 = 0;
-    m1 = digitalRead(PIN_RELAY_1);
-    m2 = digitalRead(PIN_RELAY_2);
+    m1 = digitalRead(storage.cfg.pinRelay1);
+    m2 = digitalRead(storage.cfg.pinRelay2);
     LOG_PRINTF("[IO] OL:%d CL:%d BAR:%d | M1:%d M2:%d LED:%d | POS:%.2f\n",
-               digitalRead(PIN_LIM_OPEN), digitalRead(PIN_LIM_CLOSE),
-               digitalRead(PIN_BARRIER),
-               m1, m2, digitalRead(PIN_INDICATOR), position);
+               digitalRead(storage.cfg.pinLimOpen), digitalRead(storage.cfg.pinLimClose),
+               digitalRead(storage.cfg.pinBarrier),
+               m1, m2, digitalRead(storage.cfg.pinIndicator), position);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,8 +182,8 @@ bool Motor::_relayIdle() const
 void Motor::_deenergise()
 {
     if (xSemaphoreTake(relayMtx, pdMS_TO_TICKS(10)) == pdTRUE) {
-        digitalWrite(PIN_RELAY_1, LOW);
-        digitalWrite(PIN_RELAY_2, LOW);
+        digitalWrite(storage.cfg.pinRelay1, LOW);
+        digitalWrite(storage.cfg.pinRelay2, LOW);
         _relayPhase    = RelayPhase::IDLE;
         _nextDirection = MotorState::IDLE;
         xSemaphoreGive(relayMtx);
@@ -201,10 +201,10 @@ void Motor::_startOpen()
 
     if (xSemaphoreTake(relayMtx, pdMS_TO_TICKS(10)) == pdTRUE) {
         // Cut power on both relays first for absolute safety
-        digitalWrite(PIN_RELAY_1, LOW);
-        digitalWrite(PIN_RELAY_2, LOW);
+        digitalWrite(storage.cfg.pinRelay1, LOW);
+        digitalWrite(storage.cfg.pinRelay2, LOW);
 
-        if (storage.cfg.motorMode == 1) digitalWrite(PIN_RELAY_1, LOW); // DIR=Open
+        if (storage.cfg.motorMode == 1) digitalWrite(storage.cfg.pinRelay1, LOW); // DIR=Open
 
         _relayPhase    = (storage.cfg.preBlinkDelay > 0) ? RelayPhase::PRE_BLINK : RelayPhase::WAIT_ENGAGE;
         _nextDirection = MotorState::OPENING;
@@ -224,10 +224,10 @@ void Motor::_startClose()
 
     if (xSemaphoreTake(relayMtx, pdMS_TO_TICKS(10)) == pdTRUE) {
         // Cut power on both relays first for absolute safety
-        digitalWrite(PIN_RELAY_1, LOW);
-        digitalWrite(PIN_RELAY_2, LOW);
+        digitalWrite(storage.cfg.pinRelay1, LOW);
+        digitalWrite(storage.cfg.pinRelay2, LOW);
 
-        if (storage.cfg.motorMode == 1) digitalWrite(PIN_RELAY_1, HIGH); // DIR=Close
+        if (storage.cfg.motorMode == 1) digitalWrite(storage.cfg.pinRelay1, HIGH); // DIR=Close
 
         _relayPhase    = (storage.cfg.preBlinkDelay > 0) ? RelayPhase::PRE_BLINK : RelayPhase::WAIT_ENGAGE;
         _nextDirection = MotorState::CLOSING;
@@ -253,12 +253,12 @@ void Motor::_handleRelays()
     {
         if (xSemaphoreTake(relayMtx, pdMS_TO_TICKS(1)) == pdTRUE) {
             if (storage.cfg.motorMode == 1) {
-                digitalWrite(PIN_RELAY_2, HIGH); // Enable Relay
+                digitalWrite(storage.cfg.pinRelay2, HIGH); // Enable Relay
             } else {
                 if (_nextDirection == MotorState::OPENING)
-                    digitalWrite(PIN_RELAY_1, HIGH); // Open Relay
+                    digitalWrite(storage.cfg.pinRelay1, HIGH); // Open Relay
                 else if (_nextDirection == MotorState::CLOSING)
-                    digitalWrite(PIN_RELAY_2, HIGH); // Close Relay
+                    digitalWrite(storage.cfg.pinRelay2, HIGH); // Close Relay
             }
             xSemaphoreGive(relayMtx);
         }
@@ -294,7 +294,7 @@ void Motor::_updatePosition()
     }
 
     // Travel timeout safety net
-    if (storage.cfg.travelTime > 0 && elapsed > storage.cfg.travelTime + T_TRAVEL_OVERTIME) {
+    if (storage.cfg.travelTime > 0 && elapsed > storage.cfg.travelTime + storage.cfg.tTravelOvertime) {
         LOG_PRINTLN("[Motor] Travel timeout — stopping.");
         stop(false);
     }
@@ -331,7 +331,7 @@ void Motor::_checkSafety()
 // ─────────────────────────────────────────────────────────────────────────────
 void Motor::_runCalibration()
 {
-    if (millis() - _calStart > T_CAL_SAFETY) {
+    if (millis() - _calStart > storage.cfg.tCalSafety) {
         storage.log("[Motor] Calibration timeout — aborted.");
         stop(false); calState = CalState::INACTIVE; blinkMs = 0;
         return;
@@ -426,13 +426,13 @@ String Motor::getTimerStatus() const
     unsigned long now = millis();
 
     if (calState != CalState::INACTIVE) {
-        long rem = (T_CAL_SAFETY - (now - _calStart) + 999) / 1000;
+        long rem = (storage.cfg.tCalSafety - (now - _calStart) + 999) / 1000;
         return "Cal. Timeout in " + String(rem > 0 ? rem : 0) + "s";
     }
 
     if (state != MotorState::IDLE && _relayPhase == RelayPhase::IDLE) {
         if (storage.cfg.travelTime > 0) {
-            long rem = ((storage.cfg.travelTime + T_TRAVEL_OVERTIME) - (now - _moveStart) + 999) / 1000;
+            long rem = ((storage.cfg.travelTime + storage.cfg.tTravelOvertime) - (now - _moveStart) + 999) / 1000;
             return "Travel Timeout in " + String(rem > 0 ? rem : 0) + "s";
         }
     }

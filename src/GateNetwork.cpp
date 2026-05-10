@@ -165,7 +165,7 @@ void GateNetwork::broadcastStatus()
 
         String ts = motor.getTimerStatus();
         if (rf.learnState != RFLearnState::INACTIVE) {
-            long rem = (T_RF_LEARN_TIMEOUT - (millis() - _rfStateMs) + 999) / 1000;
+            long rem = (storage.cfg.tRfLearnTimeout - (millis() - _rfStateMs) + 999) / 1000;
             ts = "RF Timeout in " + String(rem > 0 ? rem : 0) + "s";
         }
 
@@ -327,6 +327,52 @@ void GateNetwork::_handleSave(AsyncWebServerRequest *req)
     req->send(200, "application/json", "{\"status\":\"ok\",\"msg\":\"Saved! Applied instantly.\"}");
 }
 
+void GateNetwork::_handleAdvanced(AsyncWebServerRequest *req)
+{
+    auto &c = storage.cfg;
+    char json[768];
+    snprintf(json, sizeof(json),
+        "{\"p_r1\":%d,\"p_r2\":%d,\"p_ind\":%d,\"p_bm\":%d,\"p_bw\":%d,\"p_bmt\":%d,\"p_bp\":%d,"
+        "\"p_lo\":%d,\"p_lc\":%d,\"p_bar\":%d,\"p_rf\":%d,"
+        "\"t_cs\":%lu,\"t_to\":%lu,\"t_rfl\":%lu,\"t_clp\":%lu,\"t_wlp\":%lu,\"t_pp\":%lu,\"t_rp\":%lu,\"t_rfsp\":%lu,\"t_ch\":%lu,\"t_wr\":%lu}",
+        c.pinRelay1, c.pinRelay2, c.pinIndicator, c.pinBtnMain, c.pinBtnWifi, c.pinBtnMaint, c.pinBtnPed,
+        c.pinLimOpen, c.pinLimClose, c.pinBarrier, c.pinRfRx,
+        c.tCalSafety, c.tTravelOvertime, c.tRfLearnTimeout, c.tCalLongPress, c.tWifiLongPress, c.tPedPress, c.tReversePress, c.tRfSavePress, c.tComboHold, c.tWifiRetry
+    );
+    req->send(200, "application/json", json);
+}
+
+void GateNetwork::_handleAdvancedSave(AsyncWebServerRequest *req)
+{
+    auto &c = storage.cfg;
+    if(req->hasArg("p_r1")) c.pinRelay1 = req->arg("p_r1").toInt();
+    if(req->hasArg("p_r2")) c.pinRelay2 = req->arg("p_r2").toInt();
+    if(req->hasArg("p_ind")) c.pinIndicator = req->arg("p_ind").toInt();
+    if(req->hasArg("p_bm")) c.pinBtnMain = req->arg("p_bm").toInt();
+    if(req->hasArg("p_bw")) c.pinBtnWifi = req->arg("p_bw").toInt();
+    if(req->hasArg("p_bmt")) c.pinBtnMaint = req->arg("p_bmt").toInt();
+    if(req->hasArg("p_bp")) c.pinBtnPed = req->arg("p_bp").toInt();
+    if(req->hasArg("p_lo")) c.pinLimOpen = req->arg("p_lo").toInt();
+    if(req->hasArg("p_lc")) c.pinLimClose = req->arg("p_lc").toInt();
+    if(req->hasArg("p_bar")) c.pinBarrier = req->arg("p_bar").toInt();
+    if(req->hasArg("p_rf")) c.pinRfRx = req->arg("p_rf").toInt();
+
+    if(req->hasArg("t_cs")) c.tCalSafety = req->arg("t_cs").toInt();
+    if(req->hasArg("t_to")) c.tTravelOvertime = req->arg("t_to").toInt();
+    if(req->hasArg("t_rfl")) c.tRfLearnTimeout = req->arg("t_rfl").toInt();
+    if(req->hasArg("t_clp")) c.tCalLongPress = req->arg("t_clp").toInt();
+    if(req->hasArg("t_wlp")) c.tWifiLongPress = req->arg("t_wlp").toInt();
+    if(req->hasArg("t_pp")) c.tPedPress = req->arg("t_pp").toInt();
+    if(req->hasArg("t_rp")) c.tReversePress = req->arg("t_rp").toInt();
+    if(req->hasArg("t_rfsp")) c.tRfSavePress = req->arg("t_rfsp").toInt();
+    if(req->hasArg("t_ch")) c.tComboHold = req->arg("t_ch").toInt();
+    if(req->hasArg("t_wr")) c.tWifiRetry = req->arg("t_wr").toInt();
+
+    storage.save();
+    req->send(200, "application/json", "{\"status\":\"ok\",\"msg\":\"Hardware settings saved! Rebooting to apply...\"}");
+    postCmd(CMD_REBOOT);
+}
+
 void GateNetwork::_handleLogs(AsyncWebServerRequest *req)
 {
     LittleFS.exists("/system_log.txt")
@@ -353,6 +399,8 @@ void GateNetwork::_startWebServer()
     _server.on("/",           HTTP_GET,  [this](AsyncWebServerRequest *r){ _handleRoot(r);      });
     _server.on("/settings",   HTTP_GET,  [this](AsyncWebServerRequest *r){ _handleSettings(r);  });
     _server.on("/save",       HTTP_POST, [this](AsyncWebServerRequest *r){ _handleSave(r);      });
+    _server.on("/advanced",   HTTP_GET,  [this](AsyncWebServerRequest *r){ _handleAdvanced(r);  });
+    _server.on("/advanced_save", HTTP_POST, [this](AsyncWebServerRequest *r){ _handleAdvancedSave(r); });
     _server.on("/logs",       HTTP_GET,  [this](AsyncWebServerRequest *r){ _handleLogs(r);      });
     _server.on("/clear_logs", HTTP_GET,  [this](AsyncWebServerRequest *r){ _handleClearLogs(r); });
     _server.on("/open",       HTTP_GET,  [](AsyncWebServerRequest *r){ postCmd(CMD_OPEN);      r->redirect("/"); });
@@ -442,7 +490,7 @@ void GateNetwork::loop()
         _pollTelnet();
     }
 
-    if (millis() - _wifiCheck > T_WIFI_RETRY) {
+    if (millis() - _wifiCheck > storage.cfg.tWifiRetry) {
         _wifiCheck = millis();
         if (WiFi.status() != WL_CONNECTED) LOG_PRINTLN("[Net] WiFi reconnecting…");
     }

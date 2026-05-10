@@ -127,7 +127,7 @@ static void taskLogic(void *)
             rf.learnState    = RFLearnState::INACTIVE;
             storage.saveRF(rf.keys);
             motor.blinkMs    = 0;
-            btnMaint.setLongClickTime(T_CAL_LONG_PRESS);
+            btnMaint.setLongClickTime(storage.cfg.tCalLongPress);
             break;
 
         case CMD_RF_ADD_CODE:
@@ -283,7 +283,7 @@ static void taskButtons(void *)
         // WiFi + Maint held together → start RF learn
         if (btnWifi.isPressed() && btnMaint.isPressed()) {
             if (!comboStart) comboStart = millis();
-            if (millis() - comboStart > T_COMBO_HOLD) {
+            if (millis() - comboStart > storage.cfg.tComboHold) {
                 Command m = { CMD_RF_LEARN_START };
                 xQueueSend(cmdQueue, &m, 0);
                 comboStart = millis() + 5000;   // suppress re-trigger
@@ -332,32 +332,32 @@ void setup()
     }
 
     motor.begin();
-    pinMode(PIN_RF_RX, INPUT); // Explicitly configure GPIO matrix before attaching interrupt
+    pinMode(storage.cfg.pinRfRx, INPUT);
     rf.begin();
     gateNet.begin();
 
     // Button configuration
-    btnMain.begin(PIN_BTN_MAIN,  INPUT_PULLUP, true);
+    btnMain.begin(storage.cfg.pinBtnMain,  INPUT_PULLUP, true);
     btnMain.setDebounceTime(50);
     btnMain.setPressedHandler(onMainClick); // Instantaneous reaction!
     btnMain.setLongClickHandler(onMainLong);
-    btnMain.setLongClickTime(T_REVERSE_PRESS);
+    btnMain.setLongClickTime(storage.cfg.tReversePress);
 
-    btnMaint.begin(PIN_BTN_MAINT, INPUT_PULLUP, true);
+    btnMaint.begin(storage.cfg.pinBtnMaint, INPUT_PULLUP, true);
     btnMaint.setDebounceTime(50);
     btnMaint.setPressedHandler(onMaintClick); // Instantaneous reaction!
     btnMaint.setLongClickHandler(onMaintLong);
-    btnMaint.setLongClickTime(T_CAL_LONG_PRESS);
+    btnMaint.setLongClickTime(storage.cfg.tCalLongPress);
 
-    btnWifi.begin(PIN_BTN_WIFI, INPUT_PULLUP, true);
+    btnWifi.begin(storage.cfg.pinBtnWifi, INPUT_PULLUP, true);
     btnWifi.setDebounceTime(50);
     btnWifi.setLongClickHandler(onWifiLong);
-    btnWifi.setLongClickTime(T_WIFI_LONG_PRESS);
+    btnWifi.setLongClickTime(storage.cfg.tWifiLongPress);
 
-    btnPed.begin(PIN_BTN_PED, INPUT_PULLUP, true);
+    btnPed.begin(storage.cfg.pinBtnPed, INPUT_PULLUP, true);
     btnPed.setDebounceTime(50);
     btnPed.setPressedHandler(onPedClick); // Instantaneous reaction!
-    btnPed.setLongClickTime(T_PED_PRESS);
+    btnPed.setLongClickTime(storage.cfg.tPedPress);
 
     rf.setMaintButton(&btnMaint);
 

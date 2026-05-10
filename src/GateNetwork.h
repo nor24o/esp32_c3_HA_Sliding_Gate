@@ -80,6 +80,8 @@ private:
     void _handleRoot      (AsyncWebServerRequest *req);
     void _handleSettings  (AsyncWebServerRequest *req);
     void _handleSave      (AsyncWebServerRequest *req);
+    void _handleAdvanced  (AsyncWebServerRequest *req);
+    void _handleAdvancedSave (AsyncWebServerRequest *req);
     void _handleLogs      (AsyncWebServerRequest *req);
     void _handleClearLogs (AsyncWebServerRequest *req);
     void _onWsEvent(AsyncWebSocket *srv, AsyncWebSocketClient *client,

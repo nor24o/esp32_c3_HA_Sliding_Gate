@@ -34,6 +34,10 @@
     .tab-content { display: none; }
     .tab-content.active { display: block; }
     
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+    .grid label { font-size: 13px; margin-bottom: 2px; }
+    .grid input { padding: 8px; font-size: 14px; margin-bottom: 5px; }
+    
     input[type="text"], input[type="number"], input[type="password"] { width: 100%; padding: 10px; margin: 5px 0 15px; border-radius: 6px; box-sizing: border-box; background: #334155; border: 1px solid #475569; color: white; }
     label { font-size: 14px; color: #cbd5e1; display: block; margin-top: 5px; text-align: left; }
     .radio-label { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px; color: #f8fafc; font-size: 15px; cursor: pointer; text-align: left; }
@@ -55,6 +59,7 @@
   <div class="nav">
     <button id="nav-dashboard" class="active" onclick="switchTab('dashboard')">Dashboard</button>
     <button id="nav-settings" onclick="switchTab('settings')">Settings</button>
+    <button id="nav-advanced" onclick="switchTab('advanced')">Advanced</button>
   </div>
 
   <div id="tab-dashboard" class="tab-content active">
@@ -190,6 +195,33 @@
     </div>
   </div>
 
+  <div id="tab-advanced" class="tab-content">
+    <div class="card" style="text-align: left;">
+      <h2 style="text-align: center;">🛠️ Advanced Hardware</h2>
+      <form id="advancedForm" onsubmit="saveAdvanced(event)">
+          <h3>📍 Hardware Pins (GPIO)</h3>
+          <div class="grid">
+              <div><label>Relay 1</label><input type="number" name="p_r1"></div>      <div><label>Relay 2</label><input type="number" name="p_r2"></div>
+              <div><label>Warning LED</label><input type="number" name="p_ind"></div> <div><label>RF Receiver</label><input type="number" name="p_rf"></div>
+              <div><label>Limit Open</label><input type="number" name="p_lo"></div>   <div><label>Limit Close</label><input type="number" name="p_lc"></div>
+              <div><label>Photo Barrier</label><input type="number" name="p_bar"></div><div><label>Main Button</label><input type="number" name="p_bm"></div>
+              <div><label>Pedestrian Btn</label><input type="number" name="p_bp"></div><div><label>WiFi Button</label><input type="number" name="p_bw"></div>
+              <div><label>Maint Button</label><input type="number" name="p_bmt"></div>
+          </div>
+          <hr>
+          <h3>⏱️ System Timeouts (ms)</h3>
+          <div class="grid">
+              <div><label>Calib Safety Max</label><input type="number" name="t_cs"></div> <div><label>Travel Overtime</label><input type="number" name="t_to"></div>
+              <div><label>RF Learn Max</label><input type="number" name="t_rfl"></div>    <div><label>WiFi Retry Int.</label><input type="number" name="t_wr"></div>
+              <div><label>Calib Long Press</label><input type="number" name="t_clp"></div><div><label>WiFi Long Press</label><input type="number" name="t_wlp"></div>
+              <div><label>Rev. Long Press</label><input type="number" name="t_rp"></div>  <div><label>Ped Long Press</label><input type="number" name="t_pp"></div>
+              <div><label>RF Save Press</label><input type="number" name="t_rfsp"></div>  <div><label>Combo Hold</label><input type="number" name="t_ch"></div>
+          </div>
+          <button type="submit" id="saveAdvBtn" style="width: 100%; margin-top: 15px;" class="danger">⚠️ Save & Reboot</button>
+      </form>
+    </div>
+  </div>
+
   <script>
     let ws = new WebSocket(`ws://${location.hostname}/ws`);
     let scanning = false;
@@ -223,6 +255,7 @@
         document.getElementById('tab-' + tabId).classList.add('active');
         document.getElementById('nav-' + tabId).classList.add('active');
         if (tabId === 'settings') loadSettings();
+        if (tabId === 'advanced') loadAdvanced();
     }
 
     function loadSettings() {
@@ -245,6 +278,12 @@
         });
     }
 
+    function loadAdvanced() {
+        fetch('/advanced').then(r => r.json()).then(d => {
+            for (let key in d) { let el = document.querySelector(`#advancedForm input[name="${key}"]`); if(el) el.value = d[key]; }
+        });
+    }
+
     function saveSettings(e) {
         e.preventDefault();
         const btn = document.getElementById('saveBtn');
@@ -257,6 +296,15 @@
             btn.innerText = "✅ Saved successfully!";
             setTimeout(() => { btn.innerText = "💾 Save Settings"; switchTab('dashboard'); }, 1500);
         });
+    }
+
+    function saveAdvanced(e) {
+        e.preventDefault();
+        const btn = document.getElementById('saveAdvBtn');
+        btn.innerText = "⏳ Saving & Rebooting...";
+        fetch('/advanced_save', { method: 'POST', body: new FormData(e.target) })
+        .then(r => r.json()).then(d => { alert(d.msg); setTimeout(() => location.reload(), 3500); })
+        .catch(err => { setTimeout(() => location.reload(), 3500); });
     }
 
     function handleMessage(e) {

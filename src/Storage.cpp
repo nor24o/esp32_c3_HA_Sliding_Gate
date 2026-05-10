@@ -31,6 +31,15 @@ static void applyDefaults(Storage::Settings &c)
     strncpy(c.mqttPort, "1883",         sizeof(c.mqttPort) - 1);
     strncpy(c.mqttUser, "admin",        sizeof(c.mqttUser) - 1);
     strncpy(c.mqttPass, "admin",        sizeof(c.mqttPass) - 1);
+
+    c.pinRelay1 = 1;  c.pinRelay2 = 4;  c.pinIndicator = 3;
+    c.pinBtnMain = 5; c.pinBtnWifi = 6; c.pinBtnMaint = 7; c.pinBtnPed = 8;
+    c.pinLimOpen = 10; c.pinLimClose = 20; c.pinBarrier = 2; c.pinRfRx = 21;
+
+    c.tCalSafety = 90000; c.tTravelOvertime = 3000; c.tRfLearnTimeout = 60000;
+    c.tCalLongPress = 8000; c.tWifiLongPress = 5000; c.tReversePress = 1000;
+    c.tPedPress = 200; c.tRfSavePress = 1500; c.tComboHold = 2000; c.tWifiRetry = 30000;
+
     c.bootCount = 0;
 }
 
@@ -76,6 +85,29 @@ void Storage::load()
     loadStr("mqtt_user", cfg.mqttUser, sizeof(cfg.mqttUser), "admin");
     loadStr("mqtt_pass", cfg.mqttPass, sizeof(cfg.mqttPass), "admin");
 
+    cfg.pinRelay1    = prefs.getUChar("p_r1", 1);
+    cfg.pinRelay2    = prefs.getUChar("p_r2", 4);
+    cfg.pinIndicator = prefs.getUChar("p_ind", 3);
+    cfg.pinBtnMain   = prefs.getUChar("p_bm", 5);
+    cfg.pinBtnWifi   = prefs.getUChar("p_bw", 6);
+    cfg.pinBtnMaint  = prefs.getUChar("p_bmt", 7);
+    cfg.pinBtnPed    = prefs.getUChar("p_bp", 8);
+    cfg.pinLimOpen   = prefs.getUChar("p_lo", 10);
+    cfg.pinLimClose  = prefs.getUChar("p_lc", 20);
+    cfg.pinBarrier   = prefs.getUChar("p_bar", 2);
+    cfg.pinRfRx      = prefs.getUChar("p_rf", 21);
+
+    cfg.tCalSafety      = prefs.getULong("t_cs", 90000UL);
+    cfg.tTravelOvertime = prefs.getULong("t_to", 3000UL);
+    cfg.tRfLearnTimeout = prefs.getULong("t_rfl", 60000UL);
+    cfg.tCalLongPress   = prefs.getULong("t_clp", 8000UL);
+    cfg.tWifiLongPress  = prefs.getULong("t_wlp", 5000UL);
+    cfg.tReversePress   = prefs.getULong("t_rp", 1000UL);
+    cfg.tPedPress       = prefs.getULong("t_pp", 200UL);
+    cfg.tRfSavePress    = prefs.getULong("t_rfsp", 1500UL);
+    cfg.tComboHold      = prefs.getULong("t_ch", 2000UL);
+    cfg.tWifiRetry      = prefs.getULong("t_wr", 30000UL);
+
     prefs.end();
     LOG_PRINTLN("[Storage] Config loaded.");
 }
@@ -101,6 +133,30 @@ void Storage::save()
     prefs.putString("mqtt_port",  cfg.mqttPort);
     prefs.putString("mqtt_user",  cfg.mqttUser);
     prefs.putString("mqtt_pass",  cfg.mqttPass);
+
+    prefs.putUChar("p_r1", cfg.pinRelay1);
+    prefs.putUChar("p_r2", cfg.pinRelay2);
+    prefs.putUChar("p_ind", cfg.pinIndicator);
+    prefs.putUChar("p_bm", cfg.pinBtnMain);
+    prefs.putUChar("p_bw", cfg.pinBtnWifi);
+    prefs.putUChar("p_bmt", cfg.pinBtnMaint);
+    prefs.putUChar("p_bp", cfg.pinBtnPed);
+    prefs.putUChar("p_lo", cfg.pinLimOpen);
+    prefs.putUChar("p_lc", cfg.pinLimClose);
+    prefs.putUChar("p_bar", cfg.pinBarrier);
+    prefs.putUChar("p_rf", cfg.pinRfRx);
+
+    prefs.putULong("t_cs", cfg.tCalSafety);
+    prefs.putULong("t_to", cfg.tTravelOvertime);
+    prefs.putULong("t_rfl", cfg.tRfLearnTimeout);
+    prefs.putULong("t_clp", cfg.tCalLongPress);
+    prefs.putULong("t_wlp", cfg.tWifiLongPress);
+    prefs.putULong("t_rp", cfg.tReversePress);
+    prefs.putULong("t_pp", cfg.tPedPress);
+    prefs.putULong("t_rfsp", cfg.tRfSavePress);
+    prefs.putULong("t_ch", cfg.tComboHold);
+    prefs.putULong("t_wr", cfg.tWifiRetry);
+
     prefs.end();
 }
 

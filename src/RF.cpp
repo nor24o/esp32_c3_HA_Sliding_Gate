@@ -12,8 +12,9 @@ RF rf;
 
 void RF::begin()
 {
-    _sw.enableReceive(PIN_RF_RX);
-    storage.log("[RF] RCSwitch Hardware Receiver initialized on Pin " + String(PIN_RF_RX));
+    _sw.setReceiveTolerance(90); // Widen tolerance to combat ESP32 WiFi interrupt lag
+    _sw.enableReceive(storage.cfg.pinRfRx);
+    storage.log("[RF] RCSwitch Hardware Receiver initialized on Pin " + String(storage.cfg.pinRfRx));
 }
 
 void RF::setMaintButton(Button2 *btn)
@@ -42,7 +43,7 @@ void RF::startLearning()
     learnState   = RFLearnState::WAIT_OPEN;
     _learnStart  = millis();
     motor.blinkMs = BLINK_RF_LEARN;
-    if (_maintBtn) _maintBtn->setLongClickTime(T_RF_SAVE_PRESS);
+    if (_maintBtn) _maintBtn->setLongClickTime(storage.cfg.tRfSavePress);
     storage.log("[RF] Learn mode started.");
 }
 
@@ -68,10 +69,10 @@ void RF::tick()
 {
     // Learn/scan mode timeout
     if (learnState != RFLearnState::INACTIVE) {
-        if (millis() - _learnStart > T_RF_LEARN_TIMEOUT) {
+        if (millis() - _learnStart > storage.cfg.tRfLearnTimeout) {
             learnState     = RFLearnState::INACTIVE;
             motor.blinkMs  = 0;
-            if (_maintBtn) _maintBtn->setLongClickTime(T_CAL_LONG_PRESS);
+            if (_maintBtn) _maintBtn->setLongClickTime(storage.cfg.tCalLongPress);
             storage.log("[RF] Learn mode timed out.");
             return;
         }
@@ -147,7 +148,7 @@ void RF::_onLearning(unsigned long code)
         storage.saveRF(keys);
         learnState    = RFLearnState::INACTIVE;
         motor.blinkMs = 0;
-        if (_maintBtn) _maintBtn->setLongClickTime(T_CAL_LONG_PRESS);
+        if (_maintBtn) _maintBtn->setLongClickTime(storage.cfg.tCalLongPress);
         storage.log("[RF] Learn complete.");
     } else {
         learnState  = static_cast<RFLearnState>(next);

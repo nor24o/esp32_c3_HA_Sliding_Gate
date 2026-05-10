@@ -37,6 +37,32 @@ public:
         char          mqttPort[6];
         char          mqttUser[32];
         char          mqttPass[64];
+
+        // Advanced - Pins
+        uint8_t       pinRelay1;
+        uint8_t       pinRelay2;
+        uint8_t       pinIndicator;
+        uint8_t       pinBtnMain;
+        uint8_t       pinBtnWifi;
+        uint8_t       pinBtnMaint;
+        uint8_t       pinBtnPed;
+        uint8_t       pinLimOpen;
+        uint8_t       pinLimClose;
+        uint8_t       pinBarrier;
+        uint8_t       pinRfRx;
+
+        // Advanced - Internal Timers (ms)
+        unsigned long tCalSafety;
+        unsigned long tTravelOvertime;
+        unsigned long tRfLearnTimeout;
+        unsigned long tCalLongPress;
+        unsigned long tWifiLongPress;
+        unsigned long tReversePress;
+        unsigned long tPedPress;
+        unsigned long tRfSavePress;
+        unsigned long tComboHold;
+        unsigned long tWifiRetry;
+
         uint32_t      bootCount;
     } cfg;
 
