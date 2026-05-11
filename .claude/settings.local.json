@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\horva\\\\Documents\\\\PlatformIO\\\\Projects\\\\esp32_c3_HA_Sliding_Gate\" -Recurse)",
+      "Bash(Select-Object -Property FullName)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(pio run *)",
+      "Bash(pio --version)",
+      "Bash(where pio *)",
+      "Bash(pip install *)"
+    ]
+  }
+}
